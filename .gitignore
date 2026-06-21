@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+# diarization weights download + sha256-verify on first use; never commit binaries
+skills/_shared/diarization/models/
+*.bin

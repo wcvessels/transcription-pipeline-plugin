@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# CLI wrapper: transcribe audio. Add this bin/ dir to PATH to use from any terminal.
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+exec python "$DIR/skills/transcribe-audio/scripts/transcribe.py" "$@"

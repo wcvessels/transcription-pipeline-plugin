@@ -1,0 +1,153 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/wcvessels/transcription-plugin/manifest-1.0.schema.json",
+  "title": "TranscribeVideoManifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "source", "run", "transcription", "frames", "curation", "segments", "alignment", "artifacts"],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "source": {
+      "type": "object", "additionalProperties": false,
+      "required": ["uri", "type", "title", "duration_s", "width", "height", "fps", "codec"],
+      "properties": {
+        "uri": { "type": "string", "minLength": 1 },
+        "type": { "enum": ["file", "yt-dlp"] },
+        "title": { "type": ["string", "null"] },
+        "duration_s": { "type": "number", "minimum": 0 },
+        "width": { "type": "integer", "minimum": 0 },
+        "height": { "type": "integer", "minimum": 0 },
+        "fps": { "type": "number", "minimum": 0 },
+        "codec": { "type": "string" }
+      }
+    },
+    "run": {
+      "type": "object", "additionalProperties": false,
+      "required": ["run_id", "generated_at", "tool_version", "host_os", "wall_clock_s", "download_s", "processing_s"],
+      "properties": {
+        "run_id": { "type": "string", "minLength": 1 },
+        "generated_at": { "type": "string", "format": "date-time" },
+        "tool_version": { "type": "string" },
+        "host_os": { "enum": ["windows", "macos", "linux"] },
+        "wall_clock_s": { "type": "number", "minimum": 0 },
+        "download_s": { "type": "number", "minimum": 0 },
+        "processing_s": { "type": "number", "minimum": 0 }
+      }
+    },
+    "transcription": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "model", "diarization", "diarization_reason", "language", "speaker_count"],
+      "properties": {
+        "path": { "enum": ["captions", "whisperx"] },
+        "model": { "type": ["string", "null"] },
+        "diarization": { "enum": ["on", "off"] },
+        "diarization_reason": {
+          "enum": ["forced_on", "forced_off", "auto_multi_speaker", "auto_single_speaker",
+                   "auto_degraded_weights_unavailable", "auto_sample_error_failsafe_on", "captions_no_audio"]
+        },
+        "language": { "type": "string" },
+        "speaker_count": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "frames": {
+      "type": "array", "minItems": 1,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["index", "timestamp_s", "file", "is_scene_cut", "phash", "sharpness"],
+        "properties": {
+          "index": { "type": "integer", "minimum": 0 },
+          "timestamp_s": { "type": "number", "minimum": 0 },
+          "file": { "type": "string" },
+          "is_scene_cut": { "type": "boolean" },
+          "phash": { "type": "string" },
+          "sharpness": { "type": "number", "minimum": 0 }
+        }
+      }
+    },
+    "curation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["candidate_count", "window_count", "window_size", "selected_count",
+                   "dedup_dropped", "kept_count", "dedup_reduction"],
+      "properties": {
+        "candidate_count": { "type": "integer", "minimum": 0 },
+        "window_count": { "type": "integer", "minimum": 0 },
+        "window_size": { "type": "integer", "minimum": 1 },
+        "selected_count": { "type": "integer", "minimum": 0 },
+        "dedup_dropped": { "type": "integer", "minimum": 0 },
+        "kept_count": { "type": "integer", "minimum": 0 },
+        "dedup_reduction": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    },
+    "segments": {
+      "type": "array",
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["index", "start_s", "end_s", "speaker", "text", "frame_index"],
+        "properties": {
+          "index": { "type": "integer", "minimum": 0 },
+          "start_s": { "type": "number", "minimum": 0 },
+          "end_s": { "type": "number", "minimum": 0 },
+          "speaker": { "type": ["string", "null"] },
+          "text": { "type": "string" },
+          "frame_index": { "type": ["integer", "null"], "minimum": 0 }
+        }
+      }
+    },
+    "alignment": {
+      "type": "object", "additionalProperties": false,
+      "required": ["mode", "anchor_counts"],
+      "properties": {
+        "mode": { "enum": ["joint"] },
+        "anchor_counts": {
+          "type": "object", "additionalProperties": false,
+          "required": ["scene_cuts", "speaker_turns", "silence_gaps", "caption_cues"],
+          "properties": {
+            "scene_cuts": { "type": "integer", "minimum": 0 },
+            "speaker_turns": { "type": "integer", "minimum": 0 },
+            "silence_gaps": { "type": "integer", "minimum": 0 },
+            "caption_cues": { "type": "integer", "minimum": 0 }
+          }
+        }
+      }
+    },
+    "artifacts": {
+      "type": "object", "additionalProperties": false,
+      "required": ["manifest_json", "frames_dir", "transcript_txt", "contactsheet_jpg", "frames_index_md"],
+      "properties": {
+        "manifest_json": { "type": "string" },
+        "frames_dir": { "type": "string" },
+        "transcript_txt": { "type": "string" },
+        "contactsheet_jpg": { "type": "string" },
+        "frames_index_md": { "type": "string" }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": ["transcription"],
+        "properties": { "transcription": { "required": ["path"], "properties": { "path": { "const": "captions" } } } }
+      },
+      "then": {
+        "properties": {
+          "transcription": { "properties": {
+            "model": { "type": "null" },
+            "diarization": { "const": "off" },
+            "diarization_reason": { "const": "captions_no_audio" }
+          } }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["transcription"],
+        "properties": { "transcription": { "required": ["path"], "properties": { "path": { "const": "whisperx" } } } }
+      },
+      "then": {
+        "properties": {
+          "transcription": { "properties": { "model": { "type": "string" } } }
+        }
+      }
+    }
+  ]
+}

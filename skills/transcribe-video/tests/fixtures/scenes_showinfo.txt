@@ -1,0 +1,5 @@
+[Parsed_showinfo_1 @ 0000020] n:0 pts:0 pts_time:0 duration:1 duration_time:0.033
+[Parsed_showinfo_1 @ 0000020] n:1 pts:153600 pts_time:3.2 duration:1 duration_time:0.033
+[Parsed_showinfo_1 @ 0000020] n:2 pts:451584 pts_time:9.408 duration:1 duration_time:0.033
+[Parsed_showinfo_1 @ 0000020] n:3 pts:720896 pts_time:15.018 duration:1 duration_time:0.033
+frame= 4 fps=0.0 q=-0.0 Lsize=N/A time=00:00:15.05 bitrate=N/A speed=  30x
