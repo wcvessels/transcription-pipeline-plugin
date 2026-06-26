@@ -1,7 +1,7 @@
 {
   "name": "transcription",
   "description": "Local, token-free audio + video transcription with speaker diarization and best-of-window screenshot curation (WhisperX + a token-free pyannote clone). Windows + NVIDIA GPU, CPU fallback.",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": {
     "name": "Will Vessels"
   }

@@ -50,39 +50,22 @@ def sample_windows(duration_s, window_s=30.0):
     return out
 
 
-def language_detection_windows(duration_s, window_s=30.0):
-    """Windows (start_s, end_s) to run language detection on. The round-9 garbage-language bug came
-    from whisperx auto-detecting on the first ~30 s; on a silent / title-card intro that yields a
-    confident-wrong language and a junk transcript. Unlike sample_windows (a single whole-clip
-    window under 2 min, starting at t=0), this ALWAYS samples PAST the start, so a leading-silence
-    intro can never be the only thing detected on. The caller detects on each window and keeps the
-    highest-confidence result (pick_detected_language), so a window landing on silence self-eliminates."""
-    duration_s = float(duration_s)
-    if duration_s <= window_s:
-        return [(0.0, duration_s)]  # too short to spread; the whole clip is all we have
-    fracs = (0.10, 0.50, 0.90) if duration_s >= 120.0 else (0.35, 0.65)
-    out = []
-    for frac in fracs:
-        center = duration_s * frac
-        a = max(0.0, center - window_s / 2)
-        b = min(duration_s, center + window_s / 2)
-        out.append((a, b))
-    return out
+def _load_langdetect():
+    """Import the promoted shared language-detection helpers (sibling to the diarization clone).
+    transcription.py lives at transcribe-video/scripts/, so the shared dir is parents[2]/_shared/..."""
+    import importlib
+    shared = Path(__file__).resolve().parents[2] / "_shared" / "langdetect" / "scripts"
+    if str(shared) not in sys.path:
+        sys.path.insert(0, str(shared))
+    return importlib.import_module("language_detection")
 
 
-def pick_detected_language(candidates, default="en", min_confidence=0.5):
-    """Choose the best (lang, probability) across detection windows -> (language, confidence,
-    used_fallback). Picks the highest-probability candidate; if that best probability is below
-    min_confidence (or there are no candidates) returns (default, best_conf_or_0.0, True) so the
-    caller can warn loudly. This is the guard that stops a low-confidence detection (round-9 saw
-    cy@0.27 and a lucky en@0.22) from poisoning the whole transcript."""
-    best = max(candidates, key=lambda c: c[1], default=None)
-    if best is None:
-        return default, 0.0, True
-    lang, conf = best
-    if conf < min_confidence:
-        return default, conf, True
-    return lang, conf, False
+# Re-export the shared helpers at module level so existing call sites + tests (tx.<name>) resolve
+# unchanged. Bodies now live once in _shared/langdetect (were duplicated + drifting across skills).
+_ld = _load_langdetect()
+language_detection_windows = _ld.language_detection_windows
+pick_detected_language = _ld.pick_detected_language
+resolve_language = _ld.resolve_language
 
 
 def count_speakers_over_floor(seconds_per_speaker: dict, min_speaker_seconds: float) -> int:
@@ -242,39 +225,13 @@ def run_sample_pass(audio_path, duration_s, device, min_speaker_seconds=3.0):
                 pass
 
 
-def resolve_language(asr, audio, default="en"):
-    """Resolve the transcription language from SPEECH-bearing windows instead of whisperx's default
-    first-30s-of-raw-audio detection, which mis-fires on a silent / title-card intro (the round-9
-    garbage-Welsh failure). Runs faster-whisper language detection (which returns a probability,
-    unlike whisperx's wrapper) on each language_detection_windows() slice; pick_detected_language
-    keeps the highest-confidence result and falls back to `default` (with a loud warning) when even
-    the best window is unsure. Model-bound; the decision logic it relies on is unit-tested."""
-    duration_s = len(audio) / 16000.0
-    candidates = []
-    for (a, b) in language_detection_windows(duration_s):
-        clip = audio[int(a * 16000):int(b * 16000)]
-        try:
-            lang, prob, _ = asr.model.detect_language(clip)
-        except Exception as e:
-            print(f"[asr] language detect failed on window {a:.0f}-{b:.0f}s: {e}", file=sys.stderr)
-            continue
-        candidates.append((lang, prob))
-    lang, conf, used_fallback = pick_detected_language(candidates, default=default)
-    if used_fallback:
-        print(f"[asr] language detection unreliable (best conf {conf:.2f}); falling back to '{lang}'. "
-              f"Pass --language to override.", file=sys.stderr)
-    else:
-        print(f"[asr] detected language '{lang}' (conf {conf:.2f}) from a speech-bearing window.",
-              file=sys.stderr)
-    return lang
-
-
 def transcribe_segments(audio_path, model_name, language, diarize, device, compute_type):
     """WhisperX transcribe (+ optional diarization). Returns SegmentRecord-shaped list. When
     `language` is None, resolves it from speech-bearing windows (resolve_language) rather than
     whisperx's silent-intro-prone first-30s auto-detect."""
     import whisperx
     audio = whisperx.load_audio(str(audio_path))
+    print("[asr] loading ASR model (first run downloads ~3GB)...", file=sys.stderr)
     asr = whisperx.load_model(model_name, device, compute_type=compute_type, language=language)
     batch_size = auto_batch_size(detect_vram_gb() if device == "cuda" else None)
     print(f"[asr] device={device} compute_type={compute_type} batch_size={batch_size}", file=sys.stderr)

@@ -34,13 +34,13 @@ transcribe-video.bat "URL_OR_PATH"    # cmd
 2. **Caption-vs-transcribe** — if the source has captions, captures them verbatim (no audio extraction); otherwise extracts audio and transcribes with WhisperX (large-v3)
 3. **Token-free diarization** — speaker labels via the shared pyannote clone (no HF_TOKEN); `--diarize auto` runs a bounded sample pass to decide
 4. **Detects scene changes** via ffmpeg's scene filter (default threshold 0.3)
-5. **Best-of-window frame curation** — samples candidates per scene-cut settle window, scores sharpness + information, keeps the best non-junk, then perceptual-hash dedups
+5. **Best-of-window frame curation** — samples candidates per scene-cut settle window, scores sharpness + information, keeps the best non-junk, then dedups near-duplicates with a joint phash+colorhash gate
 6. **Joint-signal alignment** — maps each transcript segment to a frame by timestamp (writes `segments[].frame_index`)
 7. **Writes the curated artifact set and stops** — no guide is composed (that is a later compose tier)
 
 ## Outputs (next to source video, or in `--output-dir`) — curated artifact set
 
-- `{basename}_frames/` — curated screenshots (`frame_0001.jpg …`, best-of-window + perceptual-hash deduped)
+- `{basename}_frames/` — curated screenshots (`frame_0001_001530.jpg …`, index + `HHMMSS` timestamp; best-of-window + joint phash+colorhash deduped)
 - `{basename}_transcript.txt` — verbatim transcript (speaker-grouped on the WhisperX path; plain on the captions path) — written on **both** paths
 - `{basename}_manifest.json` — structured manifest, validates against `manifest-1.0.schema.json`
 - `{basename}_contactsheet.jpg` — thumbnail grid of the curated frames, each captioned with its timestamp
@@ -58,7 +58,7 @@ A1.0 **curates and stops** — it produces these local inputs for the prosumer c
 | `--interval-seconds N` | off | fixed-interval frames instead of scene detection |
 | `--frames-per-minute N` | `5` | target frame cadence when scene-detect finds nothing |
 | `--window-size N` | `5` | best-of-window: candidates sampled per settle window; `1` = escape hatch (plain extract-then-dedup) |
-| `--dedup-threshold N` | `5` | perceptual-hash Hamming distance for dedup; `0` disables |
+| `--dedup-threshold N` | `5` | phash Hamming distance for the joint phash+colorhash dedup gate; `0` disables all dedup |
 | `--allow-low-quality-frames` | off | if every frame scores as junk, keep the single best candidate instead of failing (accepted lower fidelity) |
 | `--model NAME` | `large-v3` | Whisper model |
 | `--language CODE` | auto | force language code |

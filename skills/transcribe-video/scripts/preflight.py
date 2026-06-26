@@ -3,11 +3,6 @@ Reports everything; blocks only on what the chosen mode needs. Neither the Whisp
 token-free diarization weights are ever a hard block (both auto-fetch on first use). Token-free
 diarization means NO mode requires HF_TOKEN or a pyannote license — those capabilities are gone."""
 import shutil
-from pathlib import Path
-
-# Diarization weights live with the promoted clone (Task 6).
-_SHARED_DIAR_MODELS = (Path.home() / ".claude" / "skills" / "_shared" / "diarization"
-                       / "models" / "diarization")
 
 
 class PreflightError(Exception):
@@ -15,7 +10,9 @@ class PreflightError(Exception):
 
 
 def report_capabilities() -> dict:
-    """JSON-serializable capability report (the SessionStart hook would print this; never blocks)."""
+    """JSON-serializable capability report; never blocks. Reports only what the per-mode gates
+    actually consume — the WhisperX model and diarization weights auto-fetch on first use, and that
+    first-run download cost is surfaced just-in-time at model load (not as a report-only key here)."""
     return {
         "ffmpeg": shutil.which("ffmpeg") is not None,
         "ffprobe": shutil.which("ffprobe") is not None,  # resolver.probe_metadata shells out to it
@@ -23,9 +20,6 @@ def report_capabilities() -> dict:
         # MODULE is what matters — a PATH-only yt-dlp binary would pass preflight then crash (R3 P1).
         "yt_dlp": _module_present("yt_dlp"),
         "gpu": _gpu_present(),
-        "model_cached": _whisperx_model_cached(),
-        # report-only: the clone auto-fetches + sha256-verifies these on first use; absence is NOT a block.
-        "diarization_weights": _diarization_weights_cached(),
     }
 
 
@@ -75,16 +69,3 @@ def _gpu_present():
         return torch.cuda.is_available()
     except Exception:
         return False
-
-
-def _whisperx_model_cached():
-    cache = Path.home() / ".cache" / "huggingface"
-    return cache.exists()
-
-
-def _diarization_weights_cached():
-    """Report-only: are the promoted clone's weights already on disk (offline-ready)? Absence is not
-    a block — the clone fetches + sha256-verifies them on first use (degrade-to-off only happens at
-    runtime in run_sample_pass if a cold-offline fetch fails)."""
-    return ((_SHARED_DIAR_MODELS / "segmentation-3.0.bin").exists()
-            and (_SHARED_DIAR_MODELS / "wespeaker-resnet34-lm.bin").exists())

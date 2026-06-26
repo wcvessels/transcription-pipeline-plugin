@@ -72,64 +72,22 @@ def symlink_privilege_hint(exc, model_name):
     )
 
 
-def language_detection_windows(duration_s, window_s=30.0):
-    """Windows (start_s, end_s) to run language detection on. whisperx auto-detects on the first
-    ~30 s of raw audio; on a silent / title-card intro that yields a confident-wrong language and a
-    junk transcript. This ALWAYS samples PAST the start so a leading-silence intro can never be the
-    only thing detected on. The caller detects on each window and keeps the highest-confidence
-    result (pick_detected_language), so a window landing on silence self-eliminates."""
-    duration_s = float(duration_s)
-    if duration_s <= window_s:
-        return [(0.0, duration_s)]  # too short to spread; the whole clip is all we have
-    fracs = (0.10, 0.50, 0.90) if duration_s >= 120.0 else (0.35, 0.65)
-    out = []
-    for frac in fracs:
-        center = duration_s * frac
-        a = max(0.0, center - window_s / 2)
-        b = min(duration_s, center + window_s / 2)
-        out.append((a, b))
-    return out
+def _load_langdetect():
+    """Import the promoted shared language-detection helpers (sibling to the diarization clone).
+    transcribe.py lives at transcribe-audio/scripts/, so the shared dir is parents[2]/_shared/..."""
+    import importlib
+    shared = Path(__file__).resolve().parents[2] / "_shared" / "langdetect" / "scripts"
+    if str(shared) not in sys.path:
+        sys.path.insert(0, str(shared))
+    return importlib.import_module("language_detection")
 
 
-def pick_detected_language(candidates, default="en", min_confidence=0.5):
-    """Choose the best (lang, probability) across detection windows -> (language, confidence,
-    used_fallback). Picks the highest-probability candidate; if that best probability is below
-    min_confidence (or there are no candidates) returns (default, best_conf_or_0.0, True) so the
-    caller can warn loudly. The guard that stops a low-confidence detection on a near-silent intro
-    from poisoning the whole transcript."""
-    best = max(candidates, key=lambda c: c[1], default=None)
-    if best is None:
-        return default, 0.0, True
-    lang, conf = best
-    if conf < min_confidence:
-        return default, conf, True
-    return lang, conf, False
-
-
-def resolve_language(asr, audio, default="en"):
-    """Resolve the transcription language from SPEECH-bearing windows instead of whisperx's default
-    first-30s-of-raw-audio detection. Runs faster-whisper language detection (which returns a
-    probability, unlike whisperx's wrapper) on each language_detection_windows() slice;
-    pick_detected_language keeps the highest-confidence result and falls back to `default` (with a
-    loud warning) when even the best window is unsure."""
-    duration_s = len(audio) / 16000.0
-    candidates = []
-    for (a, b) in language_detection_windows(duration_s):
-        clip = audio[int(a * 16000):int(b * 16000)]
-        try:
-            lang, prob, _ = asr.model.detect_language(clip)
-        except Exception as e:
-            print(f"[transcribe] language detect failed on window {a:.0f}-{b:.0f}s: {e}", file=sys.stderr)
-            continue
-        candidates.append((lang, prob))
-    lang, conf, used_fallback = pick_detected_language(candidates, default=default)
-    if used_fallback:
-        print(f"[transcribe] language detection unreliable (best conf {conf:.2f}); falling back to "
-              f"'{lang}'. Pass --language to override.", file=sys.stderr)
-    else:
-        print(f"[transcribe] detected language '{lang}' (conf {conf:.2f}) from a speech-bearing window.",
-              file=sys.stderr)
-    return lang
+# Re-export the shared helpers at module level so existing call sites + tests (tx.<name>) resolve
+# unchanged. Bodies now live once in _shared/langdetect (were duplicated + drifting across skills).
+_ld = _load_langdetect()
+language_detection_windows = _ld.language_detection_windows
+pick_detected_language = _ld.pick_detected_language
+resolve_language = _ld.resolve_language
 
 
 def transcribe(audio_path, output_dir=None, model_name="large-v3", language=None, diarize=True, formats=("txt", "srt", "json")):
@@ -168,7 +126,7 @@ def transcribe(audio_path, output_dir=None, model_name="large-v3", language=None
             raise
         sys.exit(hint)
     if language is None:
-        language = resolve_language(asr, audio)
+        language = resolve_language(asr, audio, prefix="transcribe")
     print(f"[transcribe] running ASR...", file=sys.stderr)
     result = asr.transcribe(audio, batch_size=batch_size, language=language)
     detected_lang = result.get("language", "unknown")

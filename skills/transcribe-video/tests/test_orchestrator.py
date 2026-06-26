@@ -118,6 +118,24 @@ def test_full_local_run_emits_exact_artifact_set(tmp_path):
     assert not (out / f"{b}_work").exists()
 
 
+def test_frame_filenames_are_index_prefixed_timestamps(tmp_path):
+    # Frames are named frame_<idx:04d>_<HHMMSS>.jpg: the zero-padded index prefix guarantees
+    # collision-freedom (two survivors can truncate to the same HHMMSS), the timestamp makes the
+    # file scannable. The manifest's frames[].file must match the on-disk names exactly.
+    import json
+    import re
+    f = tmp_path / "clip.mp4"; _make_tiny_mp4(f)
+    out = tmp_path / "out"
+    args = transcribe.build_parser().parse_args([str(f), "--diarize", "off", "--output-dir", str(out)])
+    assert transcribe.run_pipeline(args, deps=_FakeDeps()) == 0
+    jpgs = sorted((out / "clip_frames").glob("*.jpg"))
+    assert jpgs, "no frames emitted"
+    for p in jpgs:
+        assert re.fullmatch(r"frame_\d{4}_\d{6}\.jpg", p.name), f"unexpected frame name: {p.name}"
+    m = json.loads((out / "clip_manifest.json").read_text(encoding="utf-8"))
+    assert {fr["file"] for fr in m["frames"]} == {p.name for p in jpgs}
+
+
 def test_rerun_clears_stale_frames(tmp_path):
     # P7 (Codex F5): a rerun must not leave stale frame_00xx.jpg (or a stale guide) beyond the new
     # set. The orchestrator clears+recreates B_frames/ each run, so a frame_9999.jpg and a stale
@@ -146,8 +164,7 @@ def test_missing_ffmpeg_exits_cleanly(tmp_path, monkeypatch):
     import preflight
     f = tmp_path / "clip.mp4"; _make_tiny_mp4(f)
     monkeypatch.setattr(preflight, "report_capabilities",
-                        lambda: {"ffmpeg": False, "ffprobe": True, "yt_dlp": True,
-                                 "gpu": False, "model_cached": True, "diarization_weights": True})
+                        lambda: {"ffmpeg": False, "ffprobe": True, "yt_dlp": True, "gpu": False})
     args = transcribe.build_parser().parse_args([str(f), "--output-dir", str(tmp_path / "o")])
     with pytest.raises(SystemExit) as exc:
         transcribe.run_pipeline(args, deps=_FakeDeps())
@@ -235,9 +252,10 @@ def test_all_junk_with_allow_low_quality_completes(tmp_path, monkeypatch):
     assert len(m["frames"]) == 1
 
 
-def test_dedup_comparison_recorded_in_state_json(tmp_path):
-    # AMENDMENT (Will 2026-06-15): the run records what BOTH phash and colorhash would dedup, for an
-    # informed decision point. With --keep-work, work/state.json carries the comparison block.
+def test_dedup_recorded_in_state_json(tmp_path):
+    # state.json carries the curation block (the surviving dedup diagnostic) and NOT the retired A/B
+    # dedup_comparison block (the phash-vs-colorhash decision closed; live gate is joint). --keep-work
+    # writes work/state.json.
     import json
     f = tmp_path / "clip.mp4"; _make_tiny_mp4(f)
     out = tmp_path / "out"
@@ -246,10 +264,8 @@ def test_dedup_comparison_recorded_in_state_json(tmp_path):
     )
     assert transcribe.run_pipeline(args, deps=_FakeDeps()) == 0
     state = json.loads((out / "clip_work" / "state.json").read_text(encoding="utf-8"))
-    assert "dedup_comparison" in state
-    for method in ("phash", "colorhash"):
-        assert method in state["dedup_comparison"]
-        assert {"kept_count", "dropped", "dedup_reduction"} <= set(state["dedup_comparison"][method])
+    assert "dedup_comparison" not in state          # retired with compare_dedup_methods
+    assert {"kept_count", "dedup_dropped", "dedup_reduction"} <= set(state["curation"])
 
 
 def test_failed_run_with_staging_like_basename_preserves_work_dir(tmp_path):

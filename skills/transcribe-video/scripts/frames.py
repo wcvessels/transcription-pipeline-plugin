@@ -127,54 +127,41 @@ def extract_frame(video_path, timestamp, out_path):
 
 
 def _hashes(img_path):
-    """Compute BOTH perceptual hashes for one image (Will decision 2026-06-15, phash-vs-colorhash
-    informed comparison). phash = DCT structural hash — the §4.4 contract that drives LIVE dedup;
-    colorhash = HSV color-distribution hash, computed alongside for the comparison only."""
+    """Compute both perceptual hashes for one image: phash (DCT structural hash) and colorhash (HSV
+    colour-distribution hash). Both are ACTIVE inputs to the joint dedup gate (phash_dedup) — phash
+    keys structure, colorhash keys palette, and a drop requires both to agree."""
     img = Image.open(img_path)
     return imagehash.phash(img), imagehash.colorhash(img)
 
 
-def phash_dedup(records, threshold: int, method: str = "phash"):
-    """Drop a survivor if its hash is within `threshold` Hamming distance of the previous KEPT
-    survivor. threshold=0 disables. LIVE dedup is driven by `method` (default 'phash', the §4.4
-    contract). BOTH hashes are computed and carried on each kept record: `phash` is the §16.4
-    manifest field; `colorhash` is an in-memory diagnostic for the phash-vs-colorhash comparison
-    (the orchestrator does NOT write it to the manifest). Returns (kept_records, dropped_count);
-    kept records get a 0..k-1 index plus `phash` and `colorhash` hex strings."""
+def phash_dedup(records, threshold: int, color_threshold: int = 3):
+    """Drop a survivor when it is a near-duplicate of the previous KEPT survivor by BOTH phash
+    (structure, `threshold`) AND colorhash (palette, `color_threshold`) — the joint gate. Each hash
+    vetoes the other's blind spot: phash is colour-blind and degenerate on flat colour fields,
+    colorhash over-merges structurally-distinct frames sharing a palette (the round-9 finding), so
+    requiring both to agree keeps any frame that differs in EITHER structure or palette. `threshold`
+    == 0 globally disables dedup. last_ph and last_ch are tracked INDEPENDENTLY (a single 'last' would
+    compare a colorhash distance against a phash, silently wrong). BOTH hashes are computed and carried
+    on every kept record: `phash` is the §16.4 manifest field; `colorhash` is an in-memory diagnostic
+    the orchestrator never writes. Returns (kept_records, dropped_count); kept records get a 0..k-1
+    index plus `phash`/`colorhash` hex strings."""
     kept = []
-    last = None
+    last_ph = last_ch = None
     dropped = 0
     for rec in records:
         ph, ch = _hashes(rec["file"])
-        active = ph if method == "phash" else ch
-        if threshold > 0 and last is not None and (active - last) <= threshold:
+        if (threshold > 0 and last_ph is not None
+                and (ph - last_ph) <= threshold and (ch - last_ch) <= color_threshold):
             dropped += 1
-            continue  # near-duplicate of the last kept survivor (by the active method)
+            continue  # near-duplicate of the last kept survivor by BOTH hashes
         rec = dict(rec)
         rec["phash"] = str(ph)
         rec["colorhash"] = str(ch)
         kept.append(rec)
-        last = active
+        last_ph, last_ch = ph, ch
     for i, rec in enumerate(kept):
         rec["index"] = i
     return kept, dropped
-
-
-def compare_dedup_methods(records, threshold: int) -> dict:
-    """Run dedup under BOTH phash and colorhash over the SAME input set, for an informed
-    phash-vs-colorhash decision (Will 2026-06-15). Returns {'phash': {...}, 'colorhash': {...}},
-    each with kept_count, dropped, dedup_reduction (dropped / count). Pure comparison: does not
-    mutate `records` and does not pick a winner — the live pipeline dedups by phash."""
-    n = len(records)
-    out = {}
-    for m in ("phash", "colorhash"):
-        kept, dropped = phash_dedup(records, threshold, method=m)
-        out[m] = {
-            "kept_count": len(kept),
-            "dropped": dropped,
-            "dedup_reduction": round(dropped / n, 4) if n else 0.0,
-        }
-    return out
 
 
 def decimate(records, max_frames: int) -> list:

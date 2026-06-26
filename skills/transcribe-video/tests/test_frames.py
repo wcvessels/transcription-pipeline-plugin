@@ -114,11 +114,11 @@ def _solid_rgb(path, color):
     Image.new("RGB", (64, 64), color).save(path)
 
 
-def _checker_rgb(path, block=8):
+def _checker_rgb(path, block=8, invert=False):
     a = np.zeros((64, 64, 3), dtype="uint8")
     for r in range(0, 64, block):
         for c in range(0, 64, block):
-            if ((r // block) + (c // block)) % 2 == 0:
+            if (((r // block) + (c // block)) % 2 == 0) != invert:
                 a[r:r + block, c:c + block] = 255
     Image.fromarray(a, mode="RGB").save(path)
 
@@ -128,9 +128,10 @@ def _rec(path, ts, sharp):
 
 
 def test_phash_dedup_drops_identical_keeps_distinct(tmp_path):
-    # phash keys on STRUCTURE: three identical solid reds collapse to one; a structurally distinct
-    # frame (checkerboard) survives. (Two solid colors alone are indistinguishable to phash by
-    # design; colorhash is computed alongside for the phash-vs-colorhash comparison, Will 2026-06-15.)
+    # Joint gate on TRUE duplicates: three identical solid reds collapse to one (both phash AND
+    # colorhash match between them), while a structurally distinct frame (checkerboard) survives
+    # (phash vetoes). Distinct-palette and distinct-structure non-duplicates are the two
+    # test_joint_dedup_* cases above.
     recs = []
     for i in range(3):
         p = tmp_path / f"frame_{i:04d}.jpg"; _solid_rgb(p, (255, 0, 0))
@@ -163,20 +164,27 @@ def test_dedup_carries_both_hashes(tmp_path):
     assert all("phash" in k and "colorhash" in k for k in kept)
 
 
-def test_compare_dedup_methods_reports_both(tmp_path):
-    # The informed decision point: report what BOTH methods would do over the same survivor set.
+def test_joint_dedup_keeps_distinct_palette_same_structure(tmp_path):
+    # phash's blind spot the joint gate fixes: two solid colours are phash-identical (both flat, no
+    # structure) but colorhash-distinct. phash-only would drop one as a duplicate; the joint default
+    # keeps BOTH because colorhash vetoes the drop (the palette differs). This is the behaviour change.
     recs = []
-    for i in range(3):
-        p = tmp_path / f"frame_{i:04d}.jpg"; _solid_rgb(p, (255, 0, 0))
+    for i, color in enumerate([(255, 0, 0), (0, 0, 255)]):
+        p = tmp_path / f"frame_{i:04d}.jpg"; _solid_rgb(p, color)
         recs.append(_rec(p, float(i), 50.0))
-    chk = tmp_path / "frame_0003.jpg"; _checker_rgb(chk)
-    recs.append(_rec(chk, 3.0, 50.0))
-    cmp = frames.compare_dedup_methods(recs, threshold=5)
-    assert set(cmp) == {"phash", "colorhash"}
-    for m in ("phash", "colorhash"):
-        assert {"kept_count", "dropped", "dedup_reduction"} <= set(cmp[m])
-    # phash collapses the 3 uniform reds and keeps the structural checkerboard → 2 kept
-    assert cmp["phash"]["kept_count"] == 2
+    kept, dropped = frames.phash_dedup(recs, threshold=5)   # default method == joint
+    assert len(kept) == 2 and dropped == 0
+
+
+def test_joint_dedup_keeps_same_palette_different_structure(tmp_path):
+    # colorhash's blind spot (round-9 over-merge): a checkerboard and its inverse share a palette
+    # (colorhash-near, dist ~0) but differ structurally (phash-far). colorhash-only would drop one;
+    # the joint gate keeps BOTH because phash vetoes. This is the over-merge guard.
+    a = tmp_path / "a.jpg"; _checker_rgb(a)
+    b = tmp_path / "b.jpg"; _checker_rgb(b, invert=True)
+    recs = [_rec(a, 0.0, 50.0), _rec(b, 1.0, 50.0)]
+    kept, dropped = frames.phash_dedup(recs, threshold=5)
+    assert len(kept) == 2 and dropped == 0
 
 
 def test_synthetic_dedup_floor_drops_duplicates_keeps_distinct(tmp_path):

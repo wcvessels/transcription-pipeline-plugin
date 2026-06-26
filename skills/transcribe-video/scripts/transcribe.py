@@ -21,6 +21,7 @@ import frames as frames_mod
 import manifest as manifest_mod
 import preflight as preflight_mod
 import resolver as resolver_mod
+import timefmt as timefmt_mod
 import transcription as tx_mod
 
 TOOL_VERSION = "a1.0"
@@ -28,6 +29,11 @@ RESERVED_HINTS = {"m365", "box", "gong", "fireflies"}
 # best-of-window junk thresholds (tunable module defaults; --window-size is the exposed A1.0 knob)
 FRAME_BLUR_FLOOR = 20.0       # Laplacian-variance floor; below this a frame is "too blurry"
 FRAME_LOW_INFO_FLOOR = 2.0    # histogram-entropy floor; below this a frame is "near-blank"
+# joint dedup: colorhash Hamming tolerance (42-bit colorhash space, vs phash's 64-bit --dedup-threshold).
+# 3 ≈ phash's 5/64 ratio, slightly tighter (colorhash is the higher-variance hash) so it co-confirms a
+# drop only when the palette is also near-identical — biasing toward KEEPING frames. A module knob like
+# the junk thresholds above, deliberately NOT a CLI flag (avoids a §16.3 locked-flag-contract change).
+FRAME_COLOR_DEDUP_THRESHOLD = 3
 
 
 def _positive_int(raw):
@@ -254,19 +260,23 @@ def _run_pipeline_inner(args, deps) -> int:
                         "run anyway at lower fidelity.", cleanup=(None if args.keep_work else work))
     survivors.sort(key=lambda r: r["timestamp_s"])
     selected_count = len(survivors)
-    # AMENDMENT (Will 2026-06-15): phash-vs-colorhash decision point. Compute what BOTH methods would
-    # drop over the same survivor set so the choice can be made on real corpus data. Live dedup = phash.
-    dedup_comparison = frames_mod.compare_dedup_methods(survivors, args.dedup_threshold)
-    kept, dedup_dropped = frames_mod.phash_dedup(survivors, args.dedup_threshold)
+    # Joint dedup (default): drop a survivor only if it is a near-duplicate of the last kept frame by
+    # BOTH phash (structure) and colorhash (palette). Each hash vetoes the other's blind spot — phash
+    # is colour-blind / flat-field-degenerate, colorhash over-merges distinct frames sharing a palette
+    # (round-9). FRAME_COLOR_DEDUP_THRESHOLD is the colorhash tolerance (42-bit space vs phash's 64-bit).
+    kept, dedup_dropped = frames_mod.phash_dedup(
+        survivors, args.dedup_threshold, color_threshold=FRAME_COLOR_DEDUP_THRESHOLD)
     kept = frames_mod.decimate(kept, args.max_frames)
-    # copy kept candidates into B_frames/ as frame_0001.jpg … and build FrameRecords (with sharpness).
-    # Field-whitelist (Will 2026-06-15): only §16.4 schema fields are copied — the in-memory `colorhash`
+    # copy kept candidates into B_frames/ as frame_0001_HHMMSS.jpg … and build FrameRecords (with
+    # sharpness). Field-whitelist: only §16.4 schema fields are copied — the in-memory `colorhash`
     # diagnostic from phash_dedup is intentionally NOT propagated into the manifest (schema is frozen).
     frame_records = []
     for i, rec in enumerate(kept):
-        dest = frames_dir / f"frame_{i + 1:04d}.jpg"
-        shutil.copy(rec["file"], dest)
         ts = rec["timestamp_s"]
+        # index prefix = collision guard (two survivors can truncate to the same HHMMSS); the
+        # HHMMSS suffix makes the frame scannable on disk. fmt_clock truncates, win32-safe (no ':').
+        dest = frames_dir / f"frame_{i + 1:04d}_{timefmt_mod.fmt_clock(ts)}.jpg"
+        shutil.copy(rec["file"], dest)
         frame_records.append({
             "index": i, "timestamp_s": ts, "file": dest.name,
             "is_scene_cut": rec.get("is_scene_cut", False),   # threaded from the window origin (Gemini F3)
@@ -370,14 +380,11 @@ def _run_pipeline_inner(args, deps) -> int:
     import json
     manifest_path.write_text(json.dumps(manifest_obj, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    # state.json (§16.5): trivial single-run record. The dedup/curation counts now live in the
-    # manifest `curation` block (dedup_reduction is recorded for diagnostics — no hard floor as of the
-    # round-9 recalibration; dedup correctness is gated synthetically), so this is just a
-    # resumability stub — the F5 raw-vs-kept workaround is retired.
-    # AMENDMENT (Will 2026-06-15): also record the phash-vs-colorhash comparison for the decision point.
+    # state.json (§16.5): trivial single-run record. The dedup/curation counts live in the manifest
+    # `curation` block (dedup_reduction is recorded for diagnostics — no hard floor as of the round-9
+    # recalibration; dedup correctness is gated synthetically), so this is just a resumability stub.
     (work / "state.json").write_text(
-        json.dumps({"run_id": run_id, "path": path_kind, "curation": curation,
-                    "dedup_comparison": dedup_comparison}, indent=2),
+        json.dumps({"run_id": run_id, "path": path_kind, "curation": curation}, indent=2),
         encoding="utf-8")
 
     # 7. cleanup. §16.5: audio.wav is kept with --keep-audio OR --keep-work; the whole scratch
@@ -388,12 +395,9 @@ def _run_pipeline_inner(args, deps) -> int:
             shutil.copy(audio_src, out_dir / f"{basename}.wav")
     if not args.keep_work:
         shutil.rmtree(work, ignore_errors=True)
-    # AMENDMENT (Will 2026-06-15): surface the phash-vs-colorhash decision point on stderr.
-    _pc = dedup_comparison["phash"]
-    _cc = dedup_comparison["colorhash"]
-    print(f"[dedup] phash keep {_pc['kept_count']}/drop {_pc['dropped']} "
-          f"(reduction {_pc['dedup_reduction']:.2f}); colorhash keep {_cc['kept_count']}/drop "
-          f"{_cc['dropped']} (reduction {_cc['dedup_reduction']:.2f}). Live dedup = phash.",
+    print(f"[dedup] joint phash<={args.dedup_threshold} & colorhash<={FRAME_COLOR_DEDUP_THRESHOLD}: "
+          f"dropped {dedup_dropped}/{selected_count} survivors "
+          f"(reduction {curation['dedup_reduction']:.2f}); kept {kept_count} after max-frames cap.",
           file=sys.stderr)
     print(f"Curated artifacts written to: {out_dir}")
     return 0
