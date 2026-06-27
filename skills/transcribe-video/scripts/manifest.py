@@ -69,9 +69,9 @@ def _check_invariants(obj: dict) -> None:
 
 def build_manifest(source, run, transcription, frames, curation, segments, anchor_counts, artifacts) -> dict:
     """Assemble + validate a manifest object. `run` carries download_s/processing_s; wall_clock_s is
-    computed here so the two timing fields are single-sourced (§16.4). `curation` is the best-of-window
-    + dedup summary block; dedup_reduction is recorded for diagnostics — no hard floor (round-9
-    recalibration); dedup correctness is gated synthetically (test_frames.py)."""
+    computed here so the two timing fields are single-sourced (§16.4). `curation` is the dense
+    change-detection summary block; dedup_reduction is recorded for diagnostics — no hard floor (round-9
+    recalibration); change-detection correctness is gated by the segment_scenes unit tests (test_frames.py)."""
     run = dict(run)
     run["wall_clock_s"] = float(run["download_s"]) + float(run["processing_s"])
     obj = {

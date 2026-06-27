@@ -20,7 +20,8 @@ audio file
 video URL or file
   -> yt-dlp (URL) | direct (local file)
   -> captions present?  capture verbatim  :  extract audio -> WhisperX ASR (+ diarization)
-  -> ffmpeg scene-detect -> best-of-window frame curation (sharpness + low-info) -> phash dedup
+  -> dense 1fps sample -> content-box -> segment into held scenes by phash@16 change
+       -> keep each scene's first non-junk frame (scene-start); ffmpeg scene-cuts feed alignment anchors only
   -> joint-signal alignment (transcript segment <-> frame)
   -> write the 5-artifact curated set:
        {name}_transcript.txt, {name}_frames/, {name}_contactsheet.jpg,

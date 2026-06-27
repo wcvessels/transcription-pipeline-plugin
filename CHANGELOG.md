@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.2.0 — unreleased
+
+- **transcribe-video frame-curation rewrite** — replaced best-of-window curation with **dense change-detection**: sample at 1 fps, segment the timeline into held on-screen scenes by perceptual-hash (phash@16) change between consecutive frames, and keep each scene's first non-junk frame (its scene-start). Captures every distinct on-screen scene; fixes a bug where smooth in-app transitions left content screens uncaptured. ffmpeg scene-cuts now feed alignment anchors only. Manifest schema unchanged (`curation` fields remapped).
+
 ## 1.0.0 — unreleased
 
 Initial packaging of the transcription stack as a Claude Code plugin.

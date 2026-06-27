@@ -1,6 +1,6 @@
 ---
 name: transcribe-video
-description: Convert a video (URL or local file) into a curated artifact set — a speaker-labeled transcript, best-of-window deduped screenshots at scene-change moments, a contact sheet, and a structured manifest (the local inputs a guide or walkthrough is composed from later). Use when the user provides a video URL (YouTube, Vimeo, etc.) or a local video file (.mp4, .mov, .mkv, .webm, .avi) and wants a transcript, screenshots aligned to spoken content, or the source material for a guide or training documentation. Triggers on video file paths, video URLs, or phrases like "transcribe this video", "make a guide from", "turn this recording into docs".
+description: Convert a video (URL or local file) into a curated artifact set — a speaker-labeled transcript, curated screenshots (one per distinct on-screen scene, captured at its scene-start), a contact sheet, and a structured manifest (the local inputs a guide or walkthrough is composed from later). Use when the user provides a video URL (YouTube, Vimeo, etc.) or a local video file (.mp4, .mov, .mkv, .webm, .avi) and wants a transcript, screenshots aligned to spoken content, or the source material for a guide or training documentation. Triggers on video file paths, video URLs, or phrases like "transcribe this video", "make a guide from", "turn this recording into docs".
 ---
 
 # Video to curated artifact set (transcript + curated screenshots)
@@ -33,14 +33,14 @@ transcribe-video.bat "URL_OR_PATH"    # cmd
 1. **Detects input** — URL → downloads via `yt-dlp` (with captions if available); local file → uses directly
 2. **Caption-vs-transcribe** — if the source has captions, captures them verbatim (no audio extraction); otherwise extracts audio and transcribes with WhisperX (large-v3)
 3. **Token-free diarization** — speaker labels via the shared pyannote clone (no HF_TOKEN); `--diarize auto` runs a bounded sample pass to decide
-4. **Detects scene changes** via ffmpeg's scene filter (default threshold 0.3)
-5. **Best-of-window frame curation** — samples candidates per scene-cut settle window, scores sharpness + information, keeps the best non-junk, then dedups near-duplicates with a joint phash+colorhash gate
+4. **Dense change-detection frame curation** — samples the video at 1 fps in one pass, segments the timeline into held on-screen scenes by the perceptual-hash change between consecutive frames, and keeps the first clean frame of each scene (stamped at its scene-start, the alignment key)
+5. **ffmpeg scene detection** runs only to flag alignment anchors (`is_scene_cut`), not to choose frames
 6. **Joint-signal alignment** — maps each transcript segment to a frame by timestamp (writes `segments[].frame_index`)
 7. **Writes the curated artifact set and stops** — no guide is composed (that is a later compose tier)
 
 ## Outputs (next to source video, or in `--output-dir`) — curated artifact set
 
-- `{basename}_frames/` — curated screenshots (`frame_0001_001530.jpg …`, index + `HHMMSS` timestamp; best-of-window + joint phash+colorhash deduped)
+- `{basename}_frames/` — curated screenshots (`frame_0001_001530.jpg …`, index + `HHMMSS` timestamp; one per distinct on-screen scene via dense change-detection)
 - `{basename}_transcript.txt` — verbatim transcript (speaker-grouped on the WhisperX path; plain on the captions path) — written on **both** paths
 - `{basename}_manifest.json` — structured manifest, validates against `manifest-1.0.schema.json`
 - `{basename}_contactsheet.jpg` — thumbnail grid of the curated frames, each captioned with its timestamp
@@ -53,12 +53,12 @@ A1.0 **curates and stops** — it produces these local inputs for the prosumer c
 | Flag | Default | Purpose |
 |---|---|---|
 | `--output-dir DIR` | source's folder | where everything goes |
-| `--scene-threshold X` | `0.3` | ffmpeg scene-detection sensitivity (lower = more frames) |
-| `--max-frames N` | `100` | cap on extracted screenshots |
-| `--interval-seconds N` | off | fixed-interval frames instead of scene detection |
-| `--frames-per-minute N` | `5` | target frame cadence when scene-detect finds nothing |
-| `--window-size N` | `5` | best-of-window: candidates sampled per settle window; `1` = escape hatch (plain extract-then-dedup) |
-| `--dedup-threshold N` | `5` | phash Hamming distance for the joint phash+colorhash dedup gate; `0` disables all dedup |
+| `--scene-threshold X` | `0.3` | ffmpeg scene-cut sensitivity for **alignment anchors only** — does NOT change how many frames are kept |
+| `--max-frames N` | duration-scaled | absolute cap on kept frames; default scales with length (~40/min) so long sessions aren't capped |
+| `--interval-seconds N` | off | dense sample period in seconds (overrides the 1 fps default as rate = 1/N) |
+| `--frames-per-minute N` | — | **deprecated**: no-op under dense change-detection; retained for compatibility |
+| `--window-size N` | — | **deprecated**: no-op under dense change-detection; retained for compatibility |
+| `--dedup-threshold N` | `3` | scene-change threshold (phash@16 Hamming): a new scene starts when the frame changes by more than this; **lower = more captures**; `0` keeps every frame |
 | `--allow-low-quality-frames` | off | if every frame scores as junk, keep the single best candidate instead of failing (accepted lower fidelity) |
 | `--model NAME` | `large-v3` | Whisper model |
 | `--language CODE` | auto | force language code |
@@ -80,11 +80,11 @@ transcribe-video "C:/Recordings/training-2026-04.mp4"
 # YouTube tutorial → transcript + aligned screenshots
 transcribe-video "https://youtube.com/watch?v=..."
 
-# Long meeting with many scene changes — cap frames
+# Long meeting — cap the screenshot count with an absolute ceiling
 transcribe-video "meeting.mkv" --max-frames 50
 
-# Slide-deck recording — fewer scene changes, lower threshold
-transcribe-video "deck-walkthrough.mp4" --scene-threshold 0.15
+# Capture more screenshots (every sub-step) — lower the change threshold
+transcribe-video "deck-walkthrough.mp4" --dedup-threshold 2
 ```
 
 ## Requirements (already installed)
@@ -92,7 +92,7 @@ transcribe-video "deck-walkthrough.mp4" --scene-threshold 0.15
 - `whisperx`, `faster-whisper`, `pyannote-audio`
 - `ffmpeg` 8.1 on PATH
 - `yt-dlp` (for URL ingestion)
-- `torch` with CUDA 12.6 (GPU auto-detected (CPU fallback))
+- `torch` with CUDA 12.6 (GPU acceleration; runtime auto-selects the compute type for the card)
 - No `HF_TOKEN` and no pyannote license — diarization weights are sha256-verified public-mirror fetches, cached and offline-ready after first use
 
 ## Performance
@@ -104,5 +104,5 @@ transcribe-video "deck-walkthrough.mp4" --scene-threshold 0.15
 ## When NOT to use
 
 - Pure audio with no visual changes → use `transcribe-audio` instead (no need to extract frames)
-- Animation-heavy or game footage where scene detection misfires constantly — use `--interval-seconds`
+- Animation-heavy or game footage with constant motion — change-detection will over-capture; raise `--dedup-threshold` or cap with `--max-frames`
 - Live streams or partial downloads — yt-dlp will refuse; download full video first

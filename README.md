@@ -5,8 +5,8 @@ Runs entirely on your machine - WhisperX large-v3 + a token-free pyannote clone.
 account or token.
 
 - **transcribe-audio** - any audio file -> speaker-labeled `txt` + `srt` + `json`.
-- **transcribe-video** - a video URL or file -> a curated set: transcript + best-of-window
-  screenshots + contact sheet + schema-validated manifest (the inputs a guide is composed from later).
+- **transcribe-video** - a video URL or file -> a curated set: transcript + per-scene
+  screenshots (one per distinct on-screen scene, at its scene-start) + contact sheet + schema-validated manifest (the inputs a guide is composed from later).
 
 Windows + NVIDIA GPU recommended; CPU works but is much slower. The GPU class is auto-detected.
 

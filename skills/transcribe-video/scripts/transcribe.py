@@ -26,14 +26,16 @@ import transcription as tx_mod
 
 TOOL_VERSION = "a1.0"
 RESERVED_HINTS = {"m365", "box", "gong", "fireflies"}
-# best-of-window junk thresholds (tunable module defaults; --window-size is the exposed A1.0 knob)
-FRAME_BLUR_FLOOR = 20.0       # Laplacian-variance floor; below this a frame is "too blurry"
-FRAME_LOW_INFO_FLOOR = 2.0    # histogram-entropy floor; below this a frame is "near-blank"
-# joint dedup: colorhash Hamming tolerance (42-bit colorhash space, vs phash's 64-bit --dedup-threshold).
-# 3 ≈ phash's 5/64 ratio, slightly tighter (colorhash is the higher-variance hash) so it co-confirms a
-# drop only when the palette is also near-identical — biasing toward KEEPING frames. A module knob like
-# the junk thresholds above, deliberately NOT a CLI flag (avoids a §16.3 locked-flag-contract change).
-FRAME_COLOR_DEDUP_THRESHOLD = 3
+# dense change-detection curation knobs (tunable module defaults). §4.4.
+FRAME_BLUR_FLOOR = 20.0          # Laplacian-variance floor; below this a frame is "too blurry"
+FRAME_LOW_INFO_FLOOR = 2.0       # histogram-entropy floor; below this a frame is "near-blank"
+FRAME_SAMPLE_FPS = 1.0           # dense sample rate (frames/sec); --interval-seconds overrides as 1/N
+FRAME_HASH_SIZE = 16             # phash side (256-bit); 64-bit (size 8) can't separate held-jitter from a
+                                 # real screen change on shared-chrome app screens — the over-collapse fix
+FRAME_CONTENT_SAMPLES = 24       # dense frames sampled to compute the content box (letterbox trim)
+FRAME_CONTENT_VAR_FLOOR = 12     # per-pixel range above which a pixel is "content" (vs constant letterbox)
+FRAME_CAP_PER_MIN = 40           # runaway backstop: max kept frames per MINUTE of video (scales the
+                                 # default --max-frames by duration); only bites pathological full-motion
 
 
 def _positive_int(raw):
@@ -80,13 +82,19 @@ def build_parser():
     ap.add_argument("--keep-audio", action="store_true")
     ap.add_argument("--output-dir")
     ap.add_argument("--scene-threshold", type=float, default=0.3)
-    ap.add_argument("--max-frames", type=_positive_int, default=100)
-    ap.add_argument("--interval-seconds", type=_positive_float)
+    ap.add_argument("--max-frames", type=_positive_int, default=None,
+                    help="absolute cap on kept frames; default scales with duration "
+                         f"({FRAME_CAP_PER_MIN}/min runaway backstop), so long sessions are not capped")
+    ap.add_argument("--interval-seconds", type=_positive_float,
+                    help="dense sample period in seconds (overrides the 1 fps default as rate = 1/N)")
     # A1 new, in A1.0
-    ap.add_argument("--frames-per-minute", type=_positive_int, default=5)
+    ap.add_argument("--frames-per-minute", type=_positive_int, default=5,
+                    help="(deprecated; no-op under dense change-detection curation — retained for compatibility)")
     ap.add_argument("--window-size", type=_positive_int, default=5,
-                    help="best-of-window: candidates sampled per scene-cut settle window; 1 = escape hatch")
-    ap.add_argument("--dedup-threshold", type=_nonnegative_int, default=5, help="phash Hamming distance; 0 disables")
+                    help="(deprecated; no-op under dense change-detection curation — retained for compatibility)")
+    ap.add_argument("--dedup-threshold", type=_nonnegative_int, default=3,
+                    help="scene-change threshold: a new scene starts when the frame's phash@16 (256-bit) "
+                         "changes by more than this Hamming distance; lower = more captures; 0 keeps every frame")
     ap.add_argument("--allow-low-quality-frames", action="store_true",
                     help="if every frame scores as junk, keep the single best candidate instead of failing")
     grp = ap.add_mutually_exclusive_group()
@@ -101,9 +109,10 @@ def build_parser():
 
 
 def _resolved_flags(args):
+    # NB: the deprecated no-op flags (--frames-per-minute, --window-size) are intentionally EXCLUDED —
+    # they change nothing about the output, so they must not perturb the run_id (resumability key, §4.9).
     return {"diarize": args.diarize, "max_frames": args.max_frames,
             "scene_threshold": args.scene_threshold, "dedup_threshold": args.dedup_threshold,
-            "frames_per_minute": args.frames_per_minute, "window_size": args.window_size,
             "force_transcribe": args.force_transcribe,
             "interval_seconds": args.interval_seconds, "model": args.model}
 
@@ -207,85 +216,74 @@ def _run_pipeline_inner(args, deps) -> int:
     except preflight_mod.PreflightError as e:
         raise _fail(str(e), cleanup=(None if args.keep_work else work))
 
-    # 3. frames: best-of-window curation (locked decision #6). scene-detect → settle windows →
-    #    sample window_size candidates per window → score → keep best non-junk → phash-dedup
-    #    survivors → decimate. Candidates land in scratch; only kept frames go to B_frames/.
-    #    Scene-cut times recorded separately for alignment (decision #3).
-    scene_times = [] if args.interval_seconds else frames_mod.detect_scenes(local_path, args.scene_threshold)
-    windows = frames_mod.select_windows(meta["duration_s"], scene_times, args.interval_seconds,
-                                        args.frames_per_minute)
-    # Gemini F3: tag is_scene_cut from the WINDOW ORIGIN, not by rounding the kept frame's ts (best-of-
-    # window decouples the displayed frame from the cut). Built once, read per survivor below.
-    scene_cut_set = set(round(t, 1) for t in scene_times)
+    # 3. frames: dense change-detection curation (§4.4). ONE ffmpeg pass samples at FRAME_SAMPLE_FPS;
+    #    trim any constant letterbox borders; score + junk-filter each frame; segment the timeline into
+    #    held SCENES by the phash delta between consecutive frames (a screen change); keep the FIRST
+    #    non-junk frame of each scene (scene-START, the alignment key) → cap by duration. ffmpeg scene
+    #    cuts are computed only as alignment anchors (decoupled from sampling, decision #3).
+    scene_times = frames_mod.detect_scenes(local_path, args.scene_threshold)   # alignment anchors only
+    sample_fps = (1.0 / args.interval_seconds) if args.interval_seconds else FRAME_SAMPLE_FPS
+    cut_tol = 0.5 / sample_fps   # a frame is "at" a cut if one falls within half a sample period of it
     cand_dir = work / "candidates"
-    cand_dir.mkdir(parents=True, exist_ok=True)
-    candidate_count = 0
-    survivors = []  # best non-junk frame per window
-    all_scored = []  # every scored candidate (the global pool for --allow-low-quality-frames best-effort)
-    for wi, window in enumerate(windows):
-        win_is_cut = round(window[0], 1) in scene_cut_set   # did THIS window open at a scene cut?
-        scored = []
-        for ci, ts in enumerate(frames_mod.candidate_timestamps(window, args.window_size)):
-            cp = cand_dir / f"cand_{wi:04d}_{ci:02d}.jpg"
-            try:
-                frames_mod.extract_frame(local_path, ts, cp)
-            except Exception as e:
-                print(f"[frame] candidate failed at {ts:.2f}s: {e}", file=sys.stderr)
-                continue
-            candidate_count += 1
-            s = frames_mod.score_frame(cp)
-            cand = {"file": str(cp), "timestamp_s": ts,
-                    "sharpness": s["sharpness"], "info": s["info"]}
-            scored.append(cand)
-            all_scored.append(cand)  # also feed the global best-effort pool
-        best, _n_junk = frames_mod.best_of_window(scored, blur_floor=FRAME_BLUR_FLOOR,
-                                                  low_info_floor=FRAME_LOW_INFO_FLOOR)
-        if best is not None:
-            best["is_scene_cut"] = win_is_cut   # thread the window-origin cut flag onto the survivor
-            survivors.append(best)
+    dense = frames_mod.extract_frames_fps(local_path, sample_fps, cand_dir)   # [(path, ts)], one decode
+    candidate_count = len(dense)
+    if not dense:
+        raise _fail("no frames could be extracted from the source at all (decode failed). "
+                    "The file may be corrupt.", cleanup=(None if args.keep_work else work))
+    # content box trims constant letterbox/pillarbox borders (a no-op on full-bleed screen recordings,
+    # where nothing is globally constant; helps genuinely letterboxed sources). Change is measured on
+    # the box; on full-bleed clips that is the whole frame and the threshold carries completeness.
+    step = max(1, len(dense) // FRAME_CONTENT_SAMPLES)
+    box = frames_mod.content_box_from_paths([p for p, _ in dense[::step]], var_threshold=FRAME_CONTENT_VAR_FLOOR)
+    # score every dense frame + compute its change hash (on the box)
+    records = []
+    for p, ts in dense:
+        s = frames_mod.score_and_hash(p, box, hash_size=FRAME_HASH_SIZE)
+        records.append({"file": str(p), "timestamp_s": ts, "sharpness": s["sharpness"],
+                        "info": s["info"], "hash": s["hash"]})
+    # segment into held scenes by frame-to-frame change; keep the first non-junk frame per scene (scene-start)
+    segments = frames_mod.segment_scenes([r["hash"] for r in records], args.dedup_threshold)
+    survivors = frames_mod.first_non_junk_per_segment(records, segments, FRAME_BLUR_FLOOR, FRAME_LOW_INFO_FLOOR)
     if not survivors:
-        if args.allow_low_quality_frames and all_scored:
-            best_effort = max(all_scored, key=lambda s: s["sharpness"])
-            survivors = [best_effort]
-            print("[frame] no non-junk frames; --allow-low-quality-frames kept the single "
-                  "highest-sharpness candidate (accepted lower fidelity).", file=sys.stderr)
-        elif args.allow_low_quality_frames:
-            raise _fail("no frames could be extracted from the source at all (decode failed at every "
-                        "sampled timestamp). The file may be corrupt.",
-                        cleanup=(None if args.keep_work else work))
+        if args.allow_low_quality_frames:
+            survivors = [max(records, key=lambda r: r["sharpness"])]
+            print("[frame] every scene scored as junk; --allow-low-quality-frames kept the single "
+                  "highest-sharpness frame (accepted lower fidelity).", file=sys.stderr)
         else:
-            raise _fail("no usable frames found — every candidate scored as junk (blurry/near-blank). "
-                        "The source may be blank/static, or the blur/low-info floors too aggressive for "
-                        "it. Try --window-size 1, --scene-threshold, or --allow-low-quality-frames to "
-                        "run anyway at lower fidelity.", cleanup=(None if args.keep_work else work))
-    survivors.sort(key=lambda r: r["timestamp_s"])
+            raise _fail("no usable frames found — every sampled frame scored as junk (blurry/near-blank). "
+                        "The source may be blank/static, or the blur/low-info floors too aggressive for it. "
+                        "Try --allow-low-quality-frames to run anyway at lower fidelity.",
+                        cleanup=(None if args.keep_work else work))
     selected_count = len(survivors)
-    # Joint dedup (default): drop a survivor only if it is a near-duplicate of the last kept frame by
-    # BOTH phash (structure) and colorhash (palette). Each hash vetoes the other's blind spot — phash
-    # is colour-blind / flat-field-degenerate, colorhash over-merges distinct frames sharing a palette
-    # (round-9). FRAME_COLOR_DEDUP_THRESHOLD is the colorhash tolerance (42-bit space vs phash's 64-bit).
-    kept, dedup_dropped = frames_mod.phash_dedup(
-        survivors, args.dedup_threshold, color_threshold=FRAME_COLOR_DEDUP_THRESHOLD)
-    kept = frames_mod.decimate(kept, args.max_frames)
-    # copy kept candidates into B_frames/ as frame_0001_HHMMSS.jpg … and build FrameRecords (with
-    # sharpness). Field-whitelist: only §16.4 schema fields are copied — the in-memory `colorhash`
-    # diagnostic from phash_dedup is intentionally NOT propagated into the manifest (schema is frozen).
+    # over-capture cap (§4.4): default scales with duration (FRAME_CAP_PER_MIN/min) so long sessions are
+    # never capped by a flat number; --max-frames N overrides with an absolute ceiling. A2 culls the rest.
+    # un-probeable containers report duration_s == 0.0; the dense frame span (count/fps) is a reliable
+    # proxy, so the cap never collapses a real clip to one frame on a missing container duration.
+    cap_duration = meta["duration_s"] or (len(dense) / sample_fps)
+    kept = frames_mod.decimate(
+        survivors, frames_mod.frame_cap(cap_duration, args.max_frames, FRAME_CAP_PER_MIN))
+    # copy kept frames into B_frames/ as frame_0001_HHMMSS.jpg … and build FrameRecords. Field-whitelist:
+    # only §16.4 schema fields are written; the in-memory change `hash` is stringified into `phash`.
     frame_records = []
     for i, rec in enumerate(kept):
         ts = rec["timestamp_s"]
-        # index prefix = collision guard (two survivors can truncate to the same HHMMSS); the
-        # HHMMSS suffix makes the frame scannable on disk. fmt_clock truncates, win32-safe (no ':').
+        # index prefix = collision guard (two frames can truncate to the same HHMMSS); the HHMMSS suffix
+        # makes the frame scannable on disk. fmt_clock truncates, win32-safe (no ':').
         dest = frames_dir / f"frame_{i + 1:04d}_{timefmt_mod.fmt_clock(ts)}.jpg"
         shutil.copy(rec["file"], dest)
         frame_records.append({
             "index": i, "timestamp_s": ts, "file": dest.name,
-            "is_scene_cut": rec.get("is_scene_cut", False),   # threaded from the window origin (Gemini F3)
-            "phash": rec["phash"], "sharpness": round(float(rec["sharpness"]), 3),
+            "is_scene_cut": frames_mod.frame_at_cut(ts, scene_times, cut_tol),   # nearest-cut alignment anchor
+            "phash": str(rec["hash"]), "sharpness": round(float(rec["sharpness"]), 3),
         })
     kept_count = len(frame_records)
+    # curation block maps the dense pipeline onto the locked §16.4 fields: window == scene (window_count =
+    # scenes detected, window_size = 1 frame/scene); dedup_dropped/dedup_reduction now report the
+    # decimation (over-capture cap) trim — no absolute-similarity dedup stage exists anymore.
+    dedup_dropped = selected_count - kept_count
     curation = {
-        "candidate_count": candidate_count, "window_count": len(windows),
-        "window_size": args.window_size, "selected_count": selected_count,
+        "candidate_count": candidate_count, "window_count": len(segments),
+        "window_size": 1, "selected_count": selected_count,
         "dedup_dropped": dedup_dropped, "kept_count": kept_count,
         "dedup_reduction": round(dedup_dropped / selected_count, 4) if selected_count else 0.0,
     }
@@ -395,10 +393,10 @@ def _run_pipeline_inner(args, deps) -> int:
             shutil.copy(audio_src, out_dir / f"{basename}.wav")
     if not args.keep_work:
         shutil.rmtree(work, ignore_errors=True)
-    print(f"[dedup] joint phash<={args.dedup_threshold} & colorhash<={FRAME_COLOR_DEDUP_THRESHOLD}: "
-          f"dropped {dedup_dropped}/{selected_count} survivors "
-          f"(reduction {curation['dedup_reduction']:.2f}); kept {kept_count} after max-frames cap.",
-          file=sys.stderr)
+    print(f"[frames] dense change-detection (phash@{FRAME_HASH_SIZE} delta>{args.dedup_threshold}): "
+          f"{candidate_count} sampled → {curation['window_count']} scenes → {selected_count} "
+          f"scene-start frames → kept {kept_count} after the duration cap "
+          f"(trimmed {dedup_dropped}).", file=sys.stderr)
     print(f"Curated artifacts written to: {out_dir}")
     return 0
 

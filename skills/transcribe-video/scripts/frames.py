@@ -1,18 +1,23 @@
-"""Frame curation: scene-detect (hardened) + best-of-window selection + phash dedup. §4.4.
+"""Frame curation: dense sampling + perceptual-hash change-detection. §4.4.
 
-Best-of-window (locked decision #6): a settle window opens at each scene cut (or a fixed cadence
-when no cuts are found); we sample `window_size` candidates across it, score each for sharpness
-(variance of a numpy Laplacian) and information (histogram entropy), drop junk (blurry / near-blank),
-keep the SHARPEST non-junk candidate, then perceptual-hash-dedup the survivors. window_size=1
-collapses to plain extract-then-dedup (the escape hatch). Scene-CUT timestamps are returned as a
-distinct artifact from the curated frames (locked decision #3): alignment anchors are cut times,
-not the displayed frame's time, so moving the best-of-window pick never perturbs alignment.
+Dense change-detection (supersedes best-of-window): extract frames at a fixed cadence in one ffmpeg
+pass, trim any constant letterbox/pillarbox borders (content_box), score sharpness + info and drop junk,
+then segment the timeline into held SCENES by the phash delta between CONSECUTIVE frames (segment_scenes),
+and keep the FIRST non-junk frame of each scene (first_non_junk_per_segment) — its timestamp marks when
+the screen appeared, the alignment key. One change signal replaces both the old ffmpeg pixel-delta
+SAMPLING (too weak — only fired at hard cuts, so smooth-transition bodies got no windows) and the old
+absolute-similarity dedup (collapsed distinct screens sharing app chrome). Completeness is set by the
+change threshold (low = more captures); held screens don't over-segment because they're static at hash
+resolution. Scene-CUT timestamps from ffmpeg are still returned, but only as alignment anchors
+(decision #3), decoupled from sampling.
 
-Pure functions (select_windows, candidate_timestamps, laplacian_variance, info_entropy, is_junk,
-best_of_window, decimate) are unit-tested directly. detect_scenes/extract_frame shell out to ffmpeg
-and run only in the orchestrator + the gated e2e test."""
+Pure functions (content_box, segment_scenes, first_non_junk_per_segment, laplacian_variance,
+info_entropy, is_junk, decimate) are unit-tested directly. detect_scenes/extract_frames_fps shell out
+to ffmpeg and run only in the orchestrator + the gated e2e test."""
+import math
 import re
 import subprocess
+from pathlib import Path
 
 import imagehash
 import numpy as np
@@ -45,40 +50,95 @@ def detect_scenes(video_path, threshold: float) -> list:
     return parse_scene_times(proc.stderr)
 
 
-# ---- settle-window selection + candidate sampling (pure) ----
-
-def select_windows(duration_s, scene_times, interval_seconds, frames_per_minute, settle_s=1.0):
-    """Return [(start, end)] settle windows. Priority: explicit interval > scene cuts > fixed cadence.
-    Each window opens at a start time and spans settle_s OR until the next start, whichever is sooner,
-    so a cut quickly followed by another cut gets a short window, never an overlap. Never empty."""
-    if interval_seconds:
-        n = int(duration_s // interval_seconds)
-        starts = [i * interval_seconds for i in range(n + 1)]
-    elif scene_times:
-        starts = sorted({t for t in scene_times if 0.0 <= t <= duration_s})
-        if not starts or starts[0] > 0.0:
-            starts = [0.0] + starts
-    else:
-        fpm = frames_per_minute or 5
-        step = max(1.0, 60.0 / fpm)
-        n = int(duration_s // step)
-        starts = [i * step for i in range(max(1, n + 1))]
-    windows = []
-    for i, s in enumerate(starts):
-        nxt = starts[i + 1] if i + 1 < len(starts) else duration_s
-        end = min(s + settle_s, nxt, duration_s)
-        if end <= s:
-            end = min(s + 0.001, duration_s)
-        windows.append((float(s), float(end)))
-    return windows
+def frame_at_cut(ts, scene_times, tolerance) -> bool:
+    """True if any ffmpeg scene cut falls within `tolerance` seconds of this frame's timestamp — i.e. this
+    sampled frame is the one nearest that cut (the manifest `is_scene_cut` alignment-anchor flag). Replaces
+    brittle 0.1s-bucket equality, which almost never matched at 1 fps (frame ts are integer seconds but
+    cuts are arbitrary sub-second floats). Pass tolerance = half the sample period."""
+    return any(abs(ts - c) <= tolerance for c in scene_times)
 
 
-def candidate_timestamps(window, window_size):
-    """Evenly spaced candidate times inside a window. window_size<=1 → the single midpoint."""
-    a, b = window
-    if window_size <= 1 or b <= a:
-        return [(a + b) / 2.0]
-    return [a + i * (b - a) / (window_size - 1) for i in range(window_size)]
+# ---- content-box auto-trim (dense change-detection) ----
+
+def content_box(images, var_threshold=12):
+    """Bounding box (left/top/right/bottom FRACTIONS) of the pixels that VARY across `images` by more
+    than var_threshold — i.e. trims the GLOBALLY-CONSTANT outer borders (letterbox/pillarbox bars). On a
+    full-bleed screen recording nothing is globally constant (chrome, taskbar and webcam all change at
+    some point), so it returns the full frame — a deliberate no-op there; its job is letterboxed sources.
+    Falls back to the full frame when nothing varies. `images` are same-size PIL frames across the clip."""
+    stack = np.stack([np.asarray(im.convert("L"), dtype=np.int16) for im in images])
+    rng = stack.max(axis=0) - stack.min(axis=0)
+    active = rng > var_threshold
+    if not active.any():
+        return (0.0, 0.0, 1.0, 1.0)
+    h, w = active.shape
+    rows = np.where(active.any(axis=1))[0]
+    cols = np.where(active.any(axis=0))[0]
+    return (float(cols[0] / w), float(rows[0] / h), float((cols[-1] + 1) / w), float((rows[-1] + 1) / h))
+
+
+def crop_to_box(img, box):
+    """Crop a PIL image to a fractional (left, top, right, bottom) content box from content_box()."""
+    w, h = img.size
+    left, top, right, bottom = box
+    return img.crop((int(left * w), int(top * h), int(right * w), int(bottom * h)))
+
+
+def content_box_from_paths(paths, var_threshold=12):
+    """content_box over frames given by path — orchestrator seam (keeps PIL out of the orchestrator).
+    Loads each frame inside a `with` so file handles are released before the work dir is rmtree'd
+    (Windows holds the handle until GC otherwise)."""
+    imgs = []
+    for p in paths:
+        with Image.open(p) as im:
+            imgs.append(im.convert("L"))   # convert() reads the pixels; the handle closes with the block
+    return content_box(imgs, var_threshold)
+
+
+def score_and_hash(path, box, hash_size=16):
+    """Per dense frame: sharpness + info (for the junk filter) AND the change hash that segment_scenes
+    consumes (computed on the content box). Returns {sharpness, info, hash}. The frame is opened in a
+    `with` so its file handle is released before the work dir is cleaned up (Windows)."""
+    with Image.open(path) as img:
+        return {"sharpness": laplacian_variance(img), "info": info_entropy(img),
+                "hash": imagehash.phash(crop_to_box(img, box), hash_size=hash_size)}
+
+
+# ---- scene change-detection (segment dense frames into held scenes) ----
+
+def segment_scenes(hashes, threshold):
+    """Group ordered per-frame content-region hashes into held-scene segments: a new segment opens
+    when the perceptual-hash delta from the previous frame exceeds `threshold` (a screen change). Returns
+    a list of segments, each a list of frame indices; held frames (small jitter) stay together. This is
+    the single mechanism that replaces BOTH ffmpeg pixel-delta scene detection (too weak — diluted by
+    fixed chrome) and absolute-similarity dedup (collapsed distinct screens sharing app chrome): it keys
+    on the TRANSITION between screens, not their absolute similarity, so distinct-but-similar screens are
+    kept while a held screen collapses to one segment."""
+    if not hashes:
+        return []
+    segments = [[0]]
+    for i in range(1, len(hashes)):
+        if (hashes[i] - hashes[i - 1]) > threshold:
+            segments.append([i])
+        else:
+            segments[-1].append(i)
+    return segments
+
+
+def first_non_junk_per_segment(records, segments, blur_floor, low_info_floor):
+    """Per scene segment, return the FIRST non-junk frame (scene-START) — NOT the sharpest. The first
+    clear frame marks when the screen became visible, which is the alignment key: a transcript line
+    "this is the X screen" at time t must align to the frame stamped t, so A2 can map narration to the
+    screen on display. (Sharpest-per-segment stamped held scenes at the END of the hold — the 48/49
+    bug.) Segments whose frames are all junk are dropped. `records[i]` carries sharpness + info."""
+    out = []
+    for seg in segments:
+        for i in seg:
+            r = records[i]
+            if not is_junk(r["sharpness"], r["info"], blur_floor, low_info_floor):
+                out.append(r)
+                break
+    return out
 
 
 # ---- scoring + junk filter (real images) ----
@@ -100,68 +160,31 @@ def is_junk(sharpness, info, blur_floor, low_info_floor):
     return sharpness < blur_floor or info < low_info_floor
 
 
-def score_frame(path):
-    """Score one extracted candidate. Returns {sharpness, info}."""
-    img = Image.open(path)
-    return {"sharpness": laplacian_variance(img), "info": info_entropy(img)}
+# ---- dense extraction + decimation ----
 
-
-def best_of_window(scored, blur_floor, low_info_floor):
-    """scored = [{file, timestamp_s, sharpness, info}]. Return (best_non_junk_or_None, n_junk).
-    Best = highest sharpness among non-junk candidates; None when the whole window is junk."""
-    non_junk = [s for s in scored if not is_junk(s["sharpness"], s["info"], blur_floor, low_info_floor)]
-    n_junk = len(scored) - len(non_junk)
-    if not non_junk:
-        return None, n_junk
-    return max(non_junk, key=lambda s: s["sharpness"]), n_junk
-
-
-# ---- extraction + dedup ----
-
-def extract_frame(video_path, timestamp, out_path):
+def extract_frames_fps(video_path, rate, out_dir):
+    """Dense sampling: ONE ffmpeg decode pass emits `rate` frames/sec as d_000001.jpg…. Returns
+    [(path, timestamp_s)] in order (frame i at i/rate s). One pass replaces the old per-candidate
+    -ss seeks (one decode, fewer process spawns). Shells ffmpeg — exercised in the gated e2e test."""
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
     subprocess.run(
-        ["ffmpeg", "-y", "-ss", f"{timestamp:.3f}", "-i", str(video_path),
-         "-frames:v", "1", "-q:v", "2", str(out_path)],
+        ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(video_path),
+         "-vf", f"fps={rate}", "-q:v", "2", str(out_dir / "d_%06d.jpg")],
         check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
+    # sort by the numeric frame index, not lexicographically — d_1000000.jpg must follow d_999999.jpg
+    files = sorted(out_dir.glob("d_*.jpg"), key=lambda p: int(p.stem.split("_")[1]))
+    return [(p, i / float(rate)) for i, p in enumerate(files)]
 
 
-def _hashes(img_path):
-    """Compute both perceptual hashes for one image: phash (DCT structural hash) and colorhash (HSV
-    colour-distribution hash). Both are ACTIVE inputs to the joint dedup gate (phash_dedup) — phash
-    keys structure, colorhash keys palette, and a drop requires both to agree."""
-    img = Image.open(img_path)
-    return imagehash.phash(img), imagehash.colorhash(img)
-
-
-def phash_dedup(records, threshold: int, color_threshold: int = 3):
-    """Drop a survivor when it is a near-duplicate of the previous KEPT survivor by BOTH phash
-    (structure, `threshold`) AND colorhash (palette, `color_threshold`) — the joint gate. Each hash
-    vetoes the other's blind spot: phash is colour-blind and degenerate on flat colour fields,
-    colorhash over-merges structurally-distinct frames sharing a palette (the round-9 finding), so
-    requiring both to agree keeps any frame that differs in EITHER structure or palette. `threshold`
-    == 0 globally disables dedup. last_ph and last_ch are tracked INDEPENDENTLY (a single 'last' would
-    compare a colorhash distance against a phash, silently wrong). BOTH hashes are computed and carried
-    on every kept record: `phash` is the §16.4 manifest field; `colorhash` is an in-memory diagnostic
-    the orchestrator never writes. Returns (kept_records, dropped_count); kept records get a 0..k-1
-    index plus `phash`/`colorhash` hex strings."""
-    kept = []
-    last_ph = last_ch = None
-    dropped = 0
-    for rec in records:
-        ph, ch = _hashes(rec["file"])
-        if (threshold > 0 and last_ph is not None
-                and (ph - last_ph) <= threshold and (ch - last_ch) <= color_threshold):
-            dropped += 1
-            continue  # near-duplicate of the last kept survivor by BOTH hashes
-        rec = dict(rec)
-        rec["phash"] = str(ph)
-        rec["colorhash"] = str(ch)
-        kept.append(rec)
-        last_ph, last_ch = ph, ch
-    for i, rec in enumerate(kept):
-        rec["index"] = i
-    return kept, dropped
+def frame_cap(duration_s, explicit, per_min):
+    """Max kept frames. An explicit --max-frames wins; otherwise scale by duration (per_min per minute)
+    so long sessions are never capped by a flat number — only pathological full-motion video hits it.
+    Floor of 1."""
+    if explicit is not None:
+        return explicit
+    return max(1, math.ceil(per_min * duration_s / 60.0))
 
 
 def decimate(records, max_frames: int) -> list:

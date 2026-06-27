@@ -34,7 +34,7 @@ def write_frames_index(frame_records, frames_dir_rel, output_path):
     frames_sorted = sorted(frame_records, key=lambda f: f["timestamp_s"])
     lines = [
         "# Curated frames", "",
-        f"{len(frames_sorted)} frames (perceptual-hash deduped, best-of-window).", "",
+        f"{len(frames_sorted)} frames (one per on-screen scene, dense change-detection).", "",
         "| # | Timestamp | Sharpness | Scene cut | Frame |",
         "|---|---|---|---|---|",
     ]

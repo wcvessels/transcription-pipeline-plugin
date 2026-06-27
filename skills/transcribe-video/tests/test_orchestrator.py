@@ -1,9 +1,16 @@
 import subprocess
 from pathlib import Path
 
+import imagehash
 import pytest
 import transcribe
 import manifest
+
+
+def _junk_score_and_hash(path, box, hash_size=16):
+    """Stand-in for frames.score_and_hash that forces every frame below both junk floors (sharpness 0,
+    info 0) while still returning a valid content-region hash — exercises the all-junk fallback paths."""
+    return {"sharpness": 0.0, "info": 0.0, "hash": imagehash.hex_to_hash("0" * (hash_size * hash_size // 4))}
 
 
 def _make_tiny_mp4(path, with_audio=True):
@@ -118,6 +125,22 @@ def test_full_local_run_emits_exact_artifact_set(tmp_path):
     assert not (out / f"{b}_work").exists()
 
 
+def test_curation_block_mapping_values(tmp_path):
+    # §16.4 curation fields are REPURPOSED onto the dense change-detection model. Pin the values a frozen
+    # schema can't catch, so a wiring regression (window_size left at the old 5, or dedup_dropped computed
+    # against candidate_count instead of selected_count) is caught by a fast non-gated test.
+    import json
+    f = tmp_path / "clip.mp4"; _make_tiny_mp4(f)
+    out = tmp_path / "out"
+    args = transcribe.build_parser().parse_args([str(f), "--diarize", "off", "--output-dir", str(out)])
+    assert transcribe.run_pipeline(args, deps=_FakeDeps()) == 0
+    c = json.loads((out / "clip_manifest.json").read_text(encoding="utf-8"))["curation"]
+    assert c["window_size"] == 1                                       # 1 scene-start frame per scene
+    assert c["candidate_count"] >= c["selected_count"] >= c["kept_count"]
+    assert c["window_count"] >= c["selected_count"]                    # scenes >= scenes that yielded a frame
+    assert c["dedup_dropped"] == c["selected_count"] - c["kept_count"]  # "dedup" now == the duration-cap trim
+
+
 def test_frame_filenames_are_index_prefixed_timestamps(tmp_path):
     # Frames are named frame_<idx:04d>_<HHMMSS>.jpg: the zero-padded index prefix guarantees
     # collision-freedom (two survivors can truncate to the same HHMMSS), the timestamp makes the
@@ -218,13 +241,13 @@ def test_backstop_catches_unforeseen_error(tmp_path, monkeypatch):
 
 
 def test_all_junk_frames_exits_cleanly(tmp_path, monkeypatch):
-    # P4 (Codex F2): when best-of-window yields ZERO survivors (every candidate scores as junk) and
-    # --allow-low-quality-frames is NOT set, the run must clean-fail (exit 2) with the actionable
-    # message that names the escape hatch — not crash on an empty frame set.
+    # P4 (Codex F2): when every scene's frames score as junk and first_non_junk_per_segment returns NO
+    # survivors, and --allow-low-quality-frames is NOT set, the run must clean-fail (exit 2) with the
+    # actionable message that names the escape hatch — not crash on an empty frame set.
     f = tmp_path / "clip.mp4"; _make_tiny_mp4(f)
     import frames as frames_mod
-    # force every scored candidate below both floors (FRAME_BLUR_FLOOR / FRAME_LOW_INFO_FLOOR)
-    monkeypatch.setattr(frames_mod, "score_frame", lambda path: {"sharpness": 0.0, "info": 0.0})
+    # force every sampled frame below both floors (FRAME_BLUR_FLOOR / FRAME_LOW_INFO_FLOOR)
+    monkeypatch.setattr(frames_mod, "score_and_hash", _junk_score_and_hash)
     args = transcribe.build_parser().parse_args(
         [str(f), "--diarize", "off", "--output-dir", str(tmp_path / "o")]
     )
@@ -235,11 +258,11 @@ def test_all_junk_frames_exits_cleanly(tmp_path, monkeypatch):
 
 def test_all_junk_with_allow_low_quality_completes(tmp_path, monkeypatch):
     # P4 (Codex F2): same all-junk situation, but --allow-low-quality-frames falls back to the single
-    # highest-sharpness scored candidate so the run completes at accepted lower fidelity (exit 0,
+    # highest-sharpness sampled frame so the run completes at accepted lower fidelity (exit 0,
     # exactly one frame, schema-valid manifest).
     import frames as frames_mod
     f = tmp_path / "clip.mp4"; _make_tiny_mp4(f)
-    monkeypatch.setattr(frames_mod, "score_frame", lambda path: {"sharpness": 1.0, "info": 0.0})
+    monkeypatch.setattr(frames_mod, "score_and_hash", _junk_score_and_hash)
     out = tmp_path / "out"
     args = transcribe.build_parser().parse_args(
         [str(f), "--diarize", "off", "--allow-low-quality-frames", "--output-dir", str(out)]
