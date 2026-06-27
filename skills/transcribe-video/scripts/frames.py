@@ -41,10 +41,13 @@ def parse_scene_times(stderr_text: str) -> list:
 
 
 def detect_scenes(video_path, threshold: float) -> list:
-    """Run ffmpeg scene filter; return scene-cut timestamps (seconds)."""
+    """Run ffmpeg scene filter; return scene-cut timestamps (seconds), ZERO-BASED.
+    `setpts=PTS-STARTPTS` rebases timestamps to the first frame before showinfo reports them, so the cut
+    times share the same 0-based clock as extract_frames_fps's synthetic frame timestamps. Without it, a
+    container with a non-zero start-time offset would make every is_scene_cut anchor silently miss."""
     proc = subprocess.run(
         ["ffmpeg", "-i", str(video_path), "-filter:v",
-         f"select='gt(scene,{threshold})',showinfo", "-f", "null", "-"],
+         f"setpts=PTS-STARTPTS,select='gt(scene,{threshold})',showinfo", "-f", "null", "-"],
         capture_output=True, text=True,
     )
     return parse_scene_times(proc.stderr)
@@ -60,14 +63,9 @@ def frame_at_cut(ts, scene_times, tolerance) -> bool:
 
 # ---- content-box auto-trim (dense change-detection) ----
 
-def content_box(images, var_threshold=12):
-    """Bounding box (left/top/right/bottom FRACTIONS) of the pixels that VARY across `images` by more
-    than var_threshold — i.e. trims the GLOBALLY-CONSTANT outer borders (letterbox/pillarbox bars). On a
-    full-bleed screen recording nothing is globally constant (chrome, taskbar and webcam all change at
-    some point), so it returns the full frame — a deliberate no-op there; its job is letterboxed sources.
-    Falls back to the full frame when nothing varies. `images` are same-size PIL frames across the clip."""
-    stack = np.stack([np.asarray(im.convert("L"), dtype=np.int16) for im in images])
-    rng = stack.max(axis=0) - stack.min(axis=0)
+def _box_from_range(rng, var_threshold):
+    """Fractional content box from a per-pixel value-RANGE array: the bounding box of the pixels that vary
+    by more than var_threshold. Falls back to the full frame when nothing varies."""
     active = rng > var_threshold
     if not active.any():
         return (0.0, 0.0, 1.0, 1.0)
@@ -75,6 +73,16 @@ def content_box(images, var_threshold=12):
     rows = np.where(active.any(axis=1))[0]
     cols = np.where(active.any(axis=0))[0]
     return (float(cols[0] / w), float(rows[0] / h), float((cols[-1] + 1) / w), float((rows[-1] + 1) / h))
+
+
+def content_box(images, var_threshold=12):
+    """Bounding box (left/top/right/bottom FRACTIONS) of the pixels that VARY across `images` by more
+    than var_threshold — i.e. trims the GLOBALLY-CONSTANT outer borders (letterbox/pillarbox bars). On a
+    full-bleed screen recording nothing is globally constant (chrome, taskbar and webcam all change at
+    some point), so it returns the full frame — a deliberate no-op there; its job is letterboxed sources.
+    Falls back to the full frame when nothing varies. `images` are same-size PIL frames across the clip."""
+    stack = np.stack([np.asarray(im.convert("L"), dtype=np.int16) for im in images])
+    return _box_from_range(stack.max(axis=0) - stack.min(axis=0), var_threshold)
 
 
 def crop_to_box(img, box):
@@ -86,22 +94,34 @@ def crop_to_box(img, box):
 
 def content_box_from_paths(paths, var_threshold=12):
     """content_box over frames given by path — orchestrator seam (keeps PIL out of the orchestrator).
-    Loads each frame inside a `with` so file handles are released before the work dir is rmtree'd
-    (Windows holds the handle until GC otherwise)."""
-    imgs = []
+    Accumulates the per-pixel min/max INCREMENTALLY so the box can be computed over ALL dense frames
+    without stacking them in memory: a subsample created blind spots (a change in an unsampled frame got
+    cropped out of the box, so segment_scenes never saw it), and np.stack-ing every frame of a long clip
+    would OOM. Each frame is read inside a `with` so its handle is released before the work dir is
+    rmtree'd (Windows holds the handle until GC otherwise)."""
+    gmin = gmax = None
     for p in paths:
         with Image.open(p) as im:
-            imgs.append(im.convert("L"))   # convert() reads the pixels; the handle closes with the block
-    return content_box(imgs, var_threshold)
+            a = np.asarray(im.convert("L"), dtype=np.int16)   # convert() reads the pixels in the block
+        if gmin is None:
+            gmin, gmax = a.copy(), a.copy()
+        else:
+            np.minimum(gmin, a, out=gmin)
+            np.maximum(gmax, a, out=gmax)
+    if gmin is None:
+        return (0.0, 0.0, 1.0, 1.0)
+    return _box_from_range(gmax - gmin, var_threshold)
 
 
 def score_and_hash(path, box, hash_size=16):
     """Per dense frame: sharpness + info (for the junk filter) AND the change hash that segment_scenes
-    consumes (computed on the content box). Returns {sharpness, info, hash}. The frame is opened in a
-    `with` so its file handle is released before the work dir is cleaned up (Windows)."""
+    consumes — ALL computed on the CONTENT BOX so a letterboxed source's constant bars don't dilute a
+    valid frame below the junk floors. Returns {sharpness, info, hash}. The frame is opened in a `with`
+    so its file handle is released before the work dir is cleaned up (Windows)."""
     with Image.open(path) as img:
-        return {"sharpness": laplacian_variance(img), "info": info_entropy(img),
-                "hash": imagehash.phash(crop_to_box(img, box), hash_size=hash_size)}
+        cropped = crop_to_box(img, box)
+        return {"sharpness": laplacian_variance(cropped), "info": info_entropy(cropped),
+                "hash": imagehash.phash(cropped, hash_size=hash_size)}
 
 
 # ---- scene change-detection (segment dense frames into held scenes) ----
@@ -113,12 +133,19 @@ def segment_scenes(hashes, threshold):
     the single mechanism that replaces BOTH ffmpeg pixel-delta scene detection (too weak — diluted by
     fixed chrome) and absolute-similarity dedup (collapsed distinct screens sharing app chrome): it keys
     on the TRANSITION between screens, not their absolute similarity, so distinct-but-similar screens are
-    kept while a held screen collapses to one segment."""
+    kept while a held screen collapses to one segment.
+
+    Drift-safe: each frame is compared to its scene's ANCHOR (the segment's first frame), NOT merely the
+    previous frame. A slow transition whose consecutive deltas each stay under the threshold but whose
+    cumulative drift from the anchor exceeds it still opens a new scene (two distinct screens separated by
+    a crossfade no longer merge). A held screen with bounded jitter around the anchor stays one segment.
+    Over-segmentation of continuously-moving content is bounded downstream by the duration cap + decimate."""
     if not hashes:
         return []
     segments = [[0]]
     for i in range(1, len(hashes)):
-        if (hashes[i] - hashes[i - 1]) > threshold:
+        anchor = segments[-1][0]
+        if (hashes[i] - hashes[anchor]) > threshold:
             segments.append([i])
         else:
             segments[-1].append(i)
@@ -126,17 +153,21 @@ def segment_scenes(hashes, threshold):
 
 
 def first_non_junk_per_segment(records, segments, blur_floor, low_info_floor):
-    """Per scene segment, return the FIRST non-junk frame (scene-START) — NOT the sharpest. The first
-    clear frame marks when the screen became visible, which is the alignment key: a transcript line
-    "this is the X screen" at time t must align to the frame stamped t, so A2 can map narration to the
-    screen on display. (Sharpest-per-segment stamped held scenes at the END of the hold — the 48/49
-    bug.) Segments whose frames are all junk are dropped. `records[i]` carries sharpness + info."""
+    """Per scene segment, return the first non-junk frame's IMAGE stamped at the SCENE START. Two things
+    are deliberately DECOUPLED: the displayed image is the first CLEAR frame (not the sharpest, so the
+    screenshot is legible and early in the hold), while the alignment timestamp is the segment's first
+    frame (records[seg[0]]) — when the screen actually appeared. If leading frames of a slow transition
+    are junk, the image skips them but the timestamp does NOT drift late: that late-stamping broke the
+    is_scene_cut anchor (cut at t, frame stamped t+blur) and desynced narration ("this is the X screen"
+    landed on the previous scene). A transcript line at t now aligns to the frame stamped t. Segments
+    whose frames are all junk are dropped. `records[i]` carries sharpness + info."""
     out = []
     for seg in segments:
+        scene_start = records[seg[0]]["timestamp_s"]
         for i in seg:
             r = records[i]
             if not is_junk(r["sharpness"], r["info"], blur_floor, low_info_floor):
-                out.append(r)
+                out.append({**r, "timestamp_s": scene_start})
                 break
     return out
 
@@ -168,6 +199,8 @@ def extract_frames_fps(video_path, rate, out_dir):
     -ss seeks (one decode, fewer process spawns). Shells ffmpeg — exercised in the gated e2e test."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    for stale in out_dir.glob("d_*.jpg"):   # clear a reused dir so a prior (longer) run can't leak ghosts
+        stale.unlink()
     subprocess.run(
         ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(video_path),
          "-vf", f"fps={rate}", "-q:v", "2", str(out_dir / "d_%06d.jpg")],
@@ -188,8 +221,16 @@ def frame_cap(duration_s, explicit, per_min):
 
 
 def decimate(records, max_frames: int) -> list:
-    """Evenly thin survivor records down to max_frames (§4.4 hard cap), preserving order."""
-    if len(records) <= max_frames:
+    """Evenly thin survivor records down to max_frames (§4.4 hard cap), preserving order AND BOTH
+    endpoints. Integer index math (i*(n-1)//(m-1)) spreads the selection across the closed interval so
+    the first and last scene are always kept — the old `int(i*len/m)` stride never reached the final
+    index, silently truncating the video's ending whenever the cap bit. Returns exactly max_frames
+    distinct frames; a non-positive cap returns [] rather than dividing by zero."""
+    if max_frames <= 0:
+        return []
+    n = len(records)
+    if n <= max_frames:
         return list(records)
-    step = len(records) / max_frames
-    return [records[int(i * step)] for i in range(max_frames)]
+    if max_frames == 1:
+        return [records[0]]
+    return [records[i * (n - 1) // (max_frames - 1)] for i in range(max_frames)]

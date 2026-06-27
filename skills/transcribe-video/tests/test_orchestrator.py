@@ -303,3 +303,31 @@ def test_failed_run_with_staging_like_basename_preserves_work_dir(tmp_path):
     assert exc.value.code == 2
     # work dir preserved for diagnosis (NOT deleted), despite the staging-sentinel in the basename
     assert (out / "vid_a1_0_staging_work").is_dir()
+
+
+def test_resolved_flags_includes_allow_low_quality_frames():
+    # (Codex F4 / Gemini #7) --allow-low-quality-frames changes pipeline behavior (clean-fail vs
+    # fallback frame), so it MUST be part of the run_id resolved-flags, or a strict run and a permissive
+    # rerun collide on the same run_id.
+    a1 = transcribe.build_parser().parse_args(["clip.mp4", "--output-dir", "o"])
+    a2 = transcribe.build_parser().parse_args(["clip.mp4", "--output-dir", "o", "--allow-low-quality-frames"])
+    assert transcribe._resolved_flags(a1) != transcribe._resolved_flags(a2)
+    assert manifest.compute_run_id("clip.mp4", transcribe._resolved_flags(a1)) != \
+           manifest.compute_run_id("clip.mp4", transcribe._resolved_flags(a2))
+
+
+def test_extract_frames_fps_clears_stale_candidates(tmp_path, monkeypatch):
+    # (Codex F3 / Gemini #2) extract_frames_fps must clear pre-existing d_*.jpg before ffmpeg, so a
+    # reused candidates dir cannot leak ghost frames from a prior (longer) run into the candidate list.
+    import frames as frames_mod
+    out_dir = tmp_path / "candidates"; out_dir.mkdir()
+    for i in range(1, 101):                                # 100 stale frames from a "previous" run
+        (out_dir / f"d_{i:06d}.jpg").write_bytes(b"stale")
+    def _fake_run(cmd, **kw):                              # the "new" short clip emits only 10 frames
+        for i in range(1, 11):
+            (out_dir / f"d_{i:06d}.jpg").write_bytes(b"new")
+        class _P: pass
+        return _P()
+    monkeypatch.setattr(frames_mod.subprocess, "run", _fake_run)
+    result = frames_mod.extract_frames_fps(tmp_path / "v.mp4", 1.0, out_dir)
+    assert len(result) == 10                               # only the new frames, no stale leakage

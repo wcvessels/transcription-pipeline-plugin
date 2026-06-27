@@ -100,18 +100,23 @@ def _rec2(ts, sharp, info):
     return {"timestamp_s": ts, "sharpness": sharp, "info": info}
 
 
-def test_first_non_junk_per_segment_picks_scene_start_not_sharpest():
-    # idx0 junk (blurry); idx1 and idx2 clean. Must pick idx1 (FIRST clean = scene-start),
-    # NOT idx2 (sharpest, mid/late hold) — the alignment fix.
+def test_first_non_junk_per_segment_image_is_first_clean_but_timestamp_is_scene_start():
+    # (B / Gemini #8) the kept frame's IMAGE is the first non-junk frame (not the sharpest), but its
+    # alignment timestamp is decoupled to the SCENE START (segment[0]). idx0 is junk (blurry); the image
+    # is idx1's (first clean, sharpness 80, NOT idx2's sharper 90), stamped at idx0's time 0.0.
     recs = [_rec2(0.0, 5.0, 5.0), _rec2(1.0, 80.0, 5.0), _rec2(2.0, 90.0, 5.0)]
     out = frames.first_non_junk_per_segment(recs, [[0, 1, 2]], blur_floor=10.0, low_info_floor=1.0)
-    assert [r["timestamp_s"] for r in out] == [1.0]
+    assert len(out) == 1
+    assert out[0]["sharpness"] == 80.0     # IMAGE = first clean frame (idx1), not the sharpest (idx2)
+    assert out[0]["timestamp_s"] == 0.0    # TIMESTAMP = scene start (segment[0]=idx0), not idx1's 1.0
 
 
-def test_first_non_junk_per_segment_skips_leading_junk_within_segment():
-    recs = [_rec2(0.0, 1.0, 5.0), _rec2(1.0, 1.0, 5.0), _rec2(2.0, 50.0, 5.0)]  # 0,1 junk; 2 clean
+def test_first_non_junk_per_segment_timestamp_is_scene_start_even_skipping_leading_junk():
+    # idx0,idx1 junk; idx2 first clean. Image = idx2 (sharpness 50); timestamp = scene start 0.0.
+    recs = [_rec2(0.0, 1.0, 5.0), _rec2(1.0, 1.0, 5.0), _rec2(2.0, 50.0, 5.0)]
     out = frames.first_non_junk_per_segment(recs, [[0, 1, 2]], blur_floor=10.0, low_info_floor=1.0)
-    assert [r["timestamp_s"] for r in out] == [2.0]
+    assert out[0]["sharpness"] == 50.0
+    assert out[0]["timestamp_s"] == 0.0    # NOT idx2's 2.0 — the screen appeared at the scene start
 
 
 def test_first_non_junk_per_segment_drops_all_junk_segment():
@@ -200,3 +205,95 @@ def test_decimate_respects_max_frames():
     out = frames.decimate(recs, max_frames=100)
     assert len(out) == 100
     assert out[0]["timestamp_s"] == 0.0
+
+
+def test_decimate_preserves_last_record():
+    # (Codex F2 / Gemini #3) when the cap bites, the FINAL scene (the video's ending state) must be kept,
+    # not silently truncated. 41 survivors capped to 40 must keep BOTH endpoints (0.0 and 40.0).
+    recs = [_rec(f"f{i}.jpg", float(i), 50.0) for i in range(41)]
+    out = frames.decimate(recs, max_frames=40)
+    assert len(out) == 40
+    assert out[0]["timestamp_s"] == 0.0
+    assert out[-1]["timestamp_s"] == 40.0   # the tail-truncation bug dropped this
+
+
+def test_decimate_max_frames_one_keeps_first():
+    recs = [_rec(f"f{i}.jpg", float(i), 50.0) for i in range(5)]
+    assert [r["timestamp_s"] for r in frames.decimate(recs, max_frames=1)] == [0.0]
+
+
+def test_decimate_max_frames_zero_returns_empty():
+    # (Codex F6 / Gemini #6) defensive: a non-positive cap returns [] instead of ZeroDivisionError.
+    recs = [_rec(f"f{i}.jpg", float(i), 50.0) for i in range(5)]
+    assert frames.decimate(recs, max_frames=0) == []
+
+
+# ---- (A) anchor-baseline segmentation: catches accumulated slow drift ----
+
+def test_segment_scenes_splits_on_accumulated_drift():
+    # Consecutive deltas are all 1 (<= threshold 2) but cumulative drift from the segment ANCHOR grows.
+    # Anchor-baseline must split when drift from the scene's first frame exceeds the threshold, so a slow
+    # crossfade between two distinct screens is not collapsed into one segment (Codex C1 / Gemini #5).
+    h0 = _h([0, 0, 0, 0, 0, 0])
+    h1 = _h([1, 0, 0, 0, 0, 0])   # +1 from h0
+    h2 = _h([1, 1, 0, 0, 0, 0])   # +1 from h1, +2 from h0
+    h3 = _h([1, 1, 1, 0, 0, 0])   # +1 from h2, +3 from h0 -> breaches threshold 2
+    h4 = _h([1, 1, 1, 1, 0, 0])   # +1 from h3
+    assert frames.segment_scenes([h0, h1, h2, h3, h4], threshold=2) == [[0, 1, 2], [3, 4]]
+
+
+def test_segment_scenes_bounded_jitter_stays_one_segment_under_anchor():
+    # The tradeoff guard: anchor-baseline must NOT over-split held-screen jitter that oscillates within
+    # the threshold of the anchor (never drifting away) — it stays one segment.
+    a = _h([0, 0, 0, 0])
+    j = _h([1, 0, 0, 0])          # delta 1 from anchor, oscillating back and forth
+    assert frames.segment_scenes([a, j, a, j, a], threshold=2) == [[0, 1, 2, 3, 4]]
+
+
+# ---- content_box over ALL given frames (no subsample blind spot) ----
+
+def test_content_box_from_paths_considers_all_frames(tmp_path):
+    # (Codex F1 / Gemini #1) the box must reflect EVERY frame it is given: a region active in only ONE
+    # frame still widens the box. (The orchestrator now passes all dense frames, not a 24-sample subset.)
+    base = np.full((100, 100), 128, dtype="uint8")   # constant gray everywhere
+    paths = []
+    for i in range(8):
+        a = base.copy()
+        if i == 5:                                    # exactly one frame lights up the top-left corner
+            a[0:10, 0:10] = 255
+        p = tmp_path / f"f{i}.png"; Image.fromarray(a, "L").save(p); paths.append(str(p))
+    left, top, right, bottom = frames.content_box_from_paths(paths, var_threshold=12)
+    assert left == 0.0 and top == 0.0                 # box includes the corner that varied in one frame
+
+
+# ---- score_and_hash scores the CONTENT BOX, not the full frame ----
+
+def test_score_and_hash_scores_the_content_box_not_the_full_frame(tmp_path):
+    # (Codex F5) sharpness + info must be measured on the cropped content box, not the full frame, or a
+    # letterboxed source's black bars dilute a valid frame below the junk floors.
+    a = np.zeros((100, 100), dtype="uint8")
+    a[40:60, 40:60] = np.tile([0, 255], 200).reshape(20, 20)   # busy 20x20 center, black bars around
+    p = tmp_path / "letterboxed.png"; Image.fromarray(a, mode="L").save(p)
+    box = (0.4, 0.4, 0.6, 0.6)                                  # isolates the busy center
+    s = frames.score_and_hash(str(p), box)
+    cropped = frames.crop_to_box(Image.open(p), box)
+    assert s["sharpness"] == pytest.approx(frames.laplacian_variance(cropped))
+    assert s["info"] == pytest.approx(frames.info_entropy(cropped))
+    assert frames.laplacian_variance(Image.open(p)) < s["sharpness"]   # full frame is diluted -> lower
+
+
+# ---- detect_scenes zero-bases its timestamps to match the frame clock ----
+
+def test_detect_scenes_zero_bases_timestamps(monkeypatch):
+    # (Gemini #4) extract_frames_fps assigns synthetic 0-based timestamps; detect_scenes must prepend
+    # setpts=PTS-STARTPTS so a container start-time offset cannot silently desync is_scene_cut.
+    captured = {}
+    def _fake_run(cmd, **kw):
+        captured["cmd"] = cmd
+        class _P: stderr = ""
+        return _P()
+    monkeypatch.setattr(frames.subprocess, "run", _fake_run)
+    frames.detect_scenes("video.mp4", 0.3)
+    vf = captured["cmd"][captured["cmd"].index("-filter:v") + 1]
+    assert vf.startswith("setpts=PTS-STARTPTS,")
+    assert "select=" in vf and vf.index("setpts") < vf.index("select")

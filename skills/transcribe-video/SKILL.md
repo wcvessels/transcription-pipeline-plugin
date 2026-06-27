@@ -33,7 +33,7 @@ transcribe-video.bat "URL_OR_PATH"    # cmd
 1. **Detects input** — URL → downloads via `yt-dlp` (with captions if available); local file → uses directly
 2. **Caption-vs-transcribe** — if the source has captions, captures them verbatim (no audio extraction); otherwise extracts audio and transcribes with WhisperX (large-v3)
 3. **Token-free diarization** — speaker labels via the shared pyannote clone (no HF_TOKEN); `--diarize auto` runs a bounded sample pass to decide
-4. **Dense change-detection frame curation** — samples the video at 1 fps in one pass, segments the timeline into held on-screen scenes by the perceptual-hash change between consecutive frames, and keeps the first clean frame of each scene (stamped at its scene-start, the alignment key)
+4. **Dense change-detection frame curation** — samples the video at 1 fps in one pass, segments the timeline into held on-screen scenes by the perceptual-hash change from each scene's anchor frame (drift-safe), and keeps the first clean frame of each scene (stamped at its scene-start, the alignment key)
 5. **ffmpeg scene detection** runs only to flag alignment anchors (`is_scene_cut`), not to choose frames
 6. **Joint-signal alignment** — maps each transcript segment to a frame by timestamp (writes `segments[].frame_index`)
 7. **Writes the curated artifact set and stops** — no guide is composed (that is a later compose tier)

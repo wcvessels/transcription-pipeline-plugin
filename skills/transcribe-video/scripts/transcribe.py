@@ -32,7 +32,6 @@ FRAME_LOW_INFO_FLOOR = 2.0       # histogram-entropy floor; below this a frame i
 FRAME_SAMPLE_FPS = 1.0           # dense sample rate (frames/sec); --interval-seconds overrides as 1/N
 FRAME_HASH_SIZE = 16             # phash side (256-bit); 64-bit (size 8) can't separate held-jitter from a
                                  # real screen change on shared-chrome app screens — the over-collapse fix
-FRAME_CONTENT_SAMPLES = 24       # dense frames sampled to compute the content box (letterbox trim)
 FRAME_CONTENT_VAR_FLOOR = 12     # per-pixel range above which a pixel is "content" (vs constant letterbox)
 FRAME_CAP_PER_MIN = 40           # runaway backstop: max kept frames per MINUTE of video (scales the
                                  # default --max-frames by duration); only bites pathological full-motion
@@ -114,6 +113,7 @@ def _resolved_flags(args):
     return {"diarize": args.diarize, "max_frames": args.max_frames,
             "scene_threshold": args.scene_threshold, "dedup_threshold": args.dedup_threshold,
             "force_transcribe": args.force_transcribe,
+            "allow_low_quality_frames": args.allow_low_quality_frames,
             "interval_seconds": args.interval_seconds, "model": args.model}
 
 
@@ -233,8 +233,9 @@ def _run_pipeline_inner(args, deps) -> int:
     # content box trims constant letterbox/pillarbox borders (a no-op on full-bleed screen recordings,
     # where nothing is globally constant; helps genuinely letterboxed sources). Change is measured on
     # the box; on full-bleed clips that is the whole frame and the threshold carries completeness.
-    step = max(1, len(dense) // FRAME_CONTENT_SAMPLES)
-    box = frames_mod.content_box_from_paths([p for p, _ in dense[::step]], var_threshold=FRAME_CONTENT_VAR_FLOOR)
+    # computed over ALL dense frames (incrementally, no stacking) so a localized change in any frame
+    # cannot be cropped out before hashing — a 24-frame subsample created exactly that under-capture blind spot.
+    box = frames_mod.content_box_from_paths([p for p, _ in dense], var_threshold=FRAME_CONTENT_VAR_FLOOR)
     # score every dense frame + compute its change hash (on the box)
     records = []
     for p, ts in dense:

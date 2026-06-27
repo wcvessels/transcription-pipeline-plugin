@@ -23,10 +23,13 @@ EMBEDDING_FILE = "wespeaker-resnet34-lm.bin"
 SEGMENTATION_SHA256 = "da85c29829d4002daedd676e012936488234d9255e65e86dfab9bec6b1729298"
 EMBEDDING_SHA256 = "366edf44f4c80889a3eb7a9d7bdf02c4aede3127f7dd15e274dcdb826b143c56"
 
+# License-compliant mirrors first: tensorlake + ubitec both ship the upstream MIT LICENSE
+# (Copyright (c) 2023 CNRS); ivrit-ai carries no license/NOTICE, so it is last-resort fallback
+# only. All three are sha256-pinned to the bit-identical official file (verified 2026-06-10).
 SEGMENTATION_SOURCES = [
     "https://huggingface.co/tensorlake/segmentation-3.0/resolve/main/pytorch_model.bin",
-    "https://huggingface.co/ivrit-ai/pyannote-segmentation-3.0/resolve/main/pytorch_model.bin",
     "https://huggingface.co/ubitec/pyannote-segmentation-3.0/resolve/main/pytorch_model.bin",
+    "https://huggingface.co/ivrit-ai/pyannote-segmentation-3.0/resolve/main/pytorch_model.bin",
 ]
 EMBEDDING_SOURCES = [
     "https://huggingface.co/pyannote/wespeaker-voxceleb-resnet34-LM/resolve/main/pytorch_model.bin",

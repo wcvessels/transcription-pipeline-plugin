@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.2.1 — unreleased
+
+- **transcribe-video curation review fixes** — folded external Codex + Gemini adversarial reviews of the change-detection rewrite. Segmentation now compares each frame to its **scene anchor** (not the previous frame), so a slow transition between two distinct screens splits instead of merging; the kept frame's **image** (first clear frame) and **timestamp** (scene start) are decoupled, fixing scene-cut / narration alignment on slow transitions. Correctness fixes: the duration cap now preserves the video's final scene (was tail-truncating), the content-box trim is computed over all sampled frames (was a 24-frame subsample), junk-scoring uses the content box, and scene-cut times are zero-based to the frame clock. Manifest schema unchanged. 149 (video) + 8 (audio) tests green.
+- **Diarization mirror provenance** — `SEGMENTATION_SOURCES` reordered license-compliant-first (tensorlake → ubitec → ivrit-ai); all sha256-pinned to the identical file.
+
 ## 1.2.0 — unreleased
 
 - **transcribe-video frame-curation rewrite** — replaced best-of-window curation with **dense change-detection**: sample at 1 fps, segment the timeline into held on-screen scenes by perceptual-hash (phash@16) change between consecutive frames, and keep each scene's first non-junk frame (its scene-start). Captures every distinct on-screen scene; fixes a bug where smooth in-app transitions left content screens uncaptured. ffmpeg scene-cuts now feed alignment anchors only. Manifest schema unchanged (`curation` fields remapped).
