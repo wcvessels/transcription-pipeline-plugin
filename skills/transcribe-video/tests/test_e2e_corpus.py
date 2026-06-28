@@ -52,7 +52,7 @@ def test_corpus_configured_for_gate():
 @pytest.mark.skipif(not URL_IS_PINNED,
                     reason="pin a real captioned YouTube URL in corpus/A1.0_youtube_captions.url (§16.8) before running the captions gate")
 def test_captions_url_gate(tmp_path):
-    """§16.7: captions path → 5-artifact set (transcript on BOTH paths now), manifest valid. "Fast" is
+    """§16.7: captions path → 4-artifact set (transcript on BOTH paths now), manifest valid. "Fast" is
     STRUCTURAL — the captions path provably skips transcription (path=="captions", model==null), which is
     the speed win; processing_s is informational, not a flat cap (round-8 reframe of §16.7 #5)."""
     # --prefer-captions forces the captions path regardless of the ambient
@@ -66,10 +66,13 @@ def test_captions_url_gate(tmp_path):
     m = json.loads(manifests[0].read_text(encoding="utf-8"))
     manifest.validate_manifest(m)
     assert m["transcription"]["path"] == "captions"
-    # curate-and-stop: NO guide; the 5-artifact set; transcript present even on the captions path
+    # curate-and-stop: NO guide; the 4-artifact set; transcript present even on the captions path
     assert not list(tmp_path.glob("*_guide.md"))
     assert m["artifacts"]["transcript_txt"] and list(tmp_path.glob("*_transcript.txt"))
-    assert list(tmp_path.glob("*_contactsheet.jpg")) and list(tmp_path.glob("*_frames.md"))
+    # A1.2 Shape-1: machine set + frames.md always; no contactsheet.
+    assert m["artifacts"]["frames_index_md"] and list(tmp_path.glob("*_frames.md"))
+    assert "contactsheet_jpg" not in m["artifacts"]
+    assert not list(tmp_path.glob("*_contactsheet.jpg"))
     assert m["transcription"]["model"] is None      # §16.7 #5 reframe (round 8): captions path skips ASR, so "fast" is structural, not a flat 60s cap; processing_s logged informational
     assert 1 <= len(m["frames"]) <= args.max_frames  # §16.7 #4 bounds
     _assert_frame_index_integrity(m)                 # Codex F4: frame_index ∈ [0, len(frames))
@@ -91,7 +94,10 @@ def test_local_solo_gate(tmp_path):
     manifest.validate_manifest(m)
     assert m["transcription"]["path"] == "whisperx"
     assert m["artifacts"]["transcript_txt"] and list(tmp_path.glob("*_transcript.txt"))
-    assert list(tmp_path.glob("*_contactsheet.jpg")) and list(tmp_path.glob("*_frames.md"))
+    # A1.2 Shape-1: machine set + frames.md always; no contactsheet.
+    assert m["artifacts"]["frames_index_md"] and list(tmp_path.glob("*_frames.md"))
+    assert "contactsheet_jpg" not in m["artifacts"]
+    assert not list(tmp_path.glob("*_contactsheet.jpg"))
     # Stable property 1 — a token-free AUTO pass actually ran (no HF token, the clone executed; not
     # forced, not captions). DOCUMENTED expected case: auto_single_speaker (a solo recording resolves
     # diarization off) — but we do NOT hard-fail solely on it (per Gemini F1, see below).

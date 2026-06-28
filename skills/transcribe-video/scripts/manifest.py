@@ -1,11 +1,13 @@
-"""Manifest loading, validation, and (Task 11) assembly against manifest-1.0.schema.json."""
+"""Manifest loading, validation, and assembly against manifest-1.1.schema.json (A1.2 Shape-1: 1.1 = 1.0
+minus contactsheet_jpg; frames.md is always written, so frames_index_md is a required string). 1.0 stays
+frozen on disk for the prior 1.0 manifests + the §16.4 byte-identity baseline; new runs emit 1.1."""
 import json
 from functools import lru_cache
 from pathlib import Path
 
 import jsonschema
 
-SCHEMA_PATH = Path(__file__).resolve().parent.parent / "manifest-1.0.schema.json"
+SCHEMA_PATH = Path(__file__).resolve().parent.parent / "manifest-1.1.schema.json"
 
 # `format: date-time` (run.generated_at) is only ENFORCED when (a) a format checker is attached
 # AND (b) rfc3339-validator is installed. jsonschema otherwise treats `format` as a no-op
@@ -75,7 +77,7 @@ def build_manifest(source, run, transcription, frames, curation, segments, ancho
     run = dict(run)
     run["wall_clock_s"] = float(run["download_s"]) + float(run["processing_s"])
     obj = {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "source": source,
         "run": run,
         "transcription": transcription,

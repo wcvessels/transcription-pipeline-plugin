@@ -92,17 +92,21 @@ def crop_to_box(img, box):
     return img.crop((int(left * w), int(top * h), int(right * w), int(bottom * h)))
 
 
-def content_box_from_paths(paths, var_threshold=12):
+def content_box_from_paths(paths, var_threshold=12, thumb=200):
     """content_box over frames given by path — orchestrator seam (keeps PIL out of the orchestrator).
     Accumulates the per-pixel min/max INCREMENTALLY so the box can be computed over ALL dense frames
     without stacking them in memory: a subsample created blind spots (a change in an unsampled frame got
     cropped out of the box, so segment_scenes never saw it), and np.stack-ing every frame of a long clip
-    would OOM. Each frame is read inside a `with` so its handle is released before the work dir is
-    rmtree'd (Windows holds the handle until GC otherwise)."""
+    would OOM. Each frame is decoded to a small grayscale THUMBNAIL first (Image.draft does a fast ~1/N
+    JPEG decode; resize normalizes to a fixed square) so 'all frames' stays cheap on a long clip — opening
+    every frame full-res was the perf regression. The box is FRACTIONAL and per-axis, so the downscale
+    (even a non-uniform squash to square) preserves it. Each frame is read inside a `with` so its handle is
+    released before the work dir is rmtree'd (Windows holds the handle until GC otherwise)."""
     gmin = gmax = None
     for p in paths:
         with Image.open(p) as im:
-            a = np.asarray(im.convert("L"), dtype=np.int16)   # convert() reads the pixels in the block
+            im.draft("L", (thumb, thumb))                     # fast ~1/2..1/8 JPEG draft decode when applicable; no-op for non-JPEG
+            a = np.asarray(im.convert("L").resize((thumb, thumb)), dtype=np.int16)
         if gmin is None:
             gmin, gmax = a.copy(), a.copy()
         else:
@@ -153,22 +157,26 @@ def segment_scenes(hashes, threshold):
 
 
 def first_non_junk_per_segment(records, segments, blur_floor, low_info_floor):
-    """Per scene segment, return the first non-junk frame's IMAGE stamped at the SCENE START. Two things
+    """Per scene segment, return one representative frame's IMAGE stamped at the SCENE START. Two things
     are deliberately DECOUPLED: the displayed image is the first CLEAR frame (not the sharpest, so the
     screenshot is legible and early in the hold), while the alignment timestamp is the segment's first
     frame (records[seg[0]]) — when the screen actually appeared. If leading frames of a slow transition
     are junk, the image skips them but the timestamp does NOT drift late: that late-stamping broke the
     is_scene_cut anchor (cut at t, frame stamped t+blur) and desynced narration ("this is the X screen"
-    landed on the previous scene). A transcript line at t now aligns to the frame stamped t. Segments
-    whose frames are all junk are dropped. `records[i]` carries sharpness + info."""
+    landed on the previous scene). A transcript line at t now aligns to the frame stamped t.
+
+    Coverage invariant: the junk floors RANK frames within a scene — they never gate the scene's existence.
+    A detected scene always yields exactly one frame; if every frame is junk (e.g. a dark/animated clip
+    where motion blur sinks all of them below the floor — the dir-03 collapse: 490 scenes → 2 kept), fall
+    back to the scene's least-blurry frame rather than dropping the scene. `records[i]` carries sharpness + info."""
     out = []
     for seg in segments:
         scene_start = records[seg[0]]["timestamp_s"]
-        for i in seg:
-            r = records[i]
-            if not is_junk(r["sharpness"], r["info"], blur_floor, low_info_floor):
-                out.append({**r, "timestamp_s": scene_start})
-                break
+        pick = next((records[i] for i in seg
+                     if not is_junk(records[i]["sharpness"], records[i]["info"], blur_floor, low_info_floor)), None)
+        if pick is None:   # ponytail: all-junk scene -> least-blurry frame, never drop a detected scene
+            pick = max((records[i] for i in seg), key=lambda r: r["sharpness"])
+        out.append({**pick, "timestamp_s": scene_start})
     return out
 
 

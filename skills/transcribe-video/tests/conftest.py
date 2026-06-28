@@ -12,7 +12,7 @@ import pytest
 def _valid_captions_manifest():
     """Minimal manifest for the captions path (null model; transcript present on BOTH paths now)."""
     return {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "source": {
             "uri": "https://youtube.com/watch?v=abc", "type": "yt-dlp", "title": "Demo",
             "duration_s": 180.0, "width": 1280, "height": 720, "fps": 30.0, "codec": "h264",
@@ -43,8 +43,7 @@ def _valid_captions_manifest():
         },
         "artifacts": {
             "manifest_json": "demo_manifest.json", "frames_dir": "demo_frames",
-            "transcript_txt": "demo_transcript.txt",
-            "contactsheet_jpg": "demo_contactsheet.jpg", "frames_index_md": "demo_frames.md",
+            "transcript_txt": "demo_transcript.txt", "frames_index_md": "demo_frames.md",
         },
     }
 

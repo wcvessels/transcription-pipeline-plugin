@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """transcribe-video A1.0 — local video file / public URL → CURATED ARTIFACT SET
-(frames + transcript + manifest + contact sheet + frames index).
+(frames + transcript + manifest + frames index).
 
 Curate-and-stop vertical slice per DESIGN_video-ingest-plugin.md §16. One linear invocation, no
 packaging, no Claude, no handoff state machine, **no guide composition** (that migrated up to the
@@ -87,15 +87,9 @@ def build_parser():
     ap.add_argument("--interval-seconds", type=_positive_float,
                     help="dense sample period in seconds (overrides the 1 fps default as rate = 1/N)")
     # A1 new, in A1.0
-    ap.add_argument("--frames-per-minute", type=_positive_int, default=5,
-                    help="(deprecated; no-op under dense change-detection curation — retained for compatibility)")
-    ap.add_argument("--window-size", type=_positive_int, default=5,
-                    help="(deprecated; no-op under dense change-detection curation — retained for compatibility)")
     ap.add_argument("--dedup-threshold", type=_nonnegative_int, default=3,
                     help="scene-change threshold: a new scene starts when the frame's phash@16 (256-bit) "
                          "changes by more than this Hamming distance; lower = more captures; 0 keeps every frame")
-    ap.add_argument("--allow-low-quality-frames", action="store_true",
-                    help="if every frame scores as junk, keep the single best candidate instead of failing")
     grp = ap.add_mutually_exclusive_group()
     grp.add_argument("--force-transcribe", dest="force_transcribe", action="store_true", default=None,
                      help="force WhisperX even if captions exist (overrides the env default)")
@@ -108,12 +102,11 @@ def build_parser():
 
 
 def _resolved_flags(args):
-    # NB: the deprecated no-op flags (--frames-per-minute, --window-size) are intentionally EXCLUDED —
-    # they change nothing about the output, so they must not perturb the run_id (resumability key, §4.9).
+    # run_id inputs (§4.9): only the flags that change the curated output. Cosmetic/--keep-* flags are
+    # excluded so they never perturb the run_id (resumability key).
     return {"diarize": args.diarize, "max_frames": args.max_frames,
             "scene_threshold": args.scene_threshold, "dedup_threshold": args.dedup_threshold,
             "force_transcribe": args.force_transcribe,
-            "allow_low_quality_frames": args.allow_low_quality_frames,
             "interval_seconds": args.interval_seconds, "model": args.model}
 
 
@@ -245,16 +238,9 @@ def _run_pipeline_inner(args, deps) -> int:
     # segment into held scenes by frame-to-frame change; keep the first non-junk frame per scene (scene-start)
     segments = frames_mod.segment_scenes([r["hash"] for r in records], args.dedup_threshold)
     survivors = frames_mod.first_non_junk_per_segment(records, segments, FRAME_BLUR_FLOOR, FRAME_LOW_INFO_FLOOR)
-    if not survivors:
-        if args.allow_low_quality_frames:
-            survivors = [max(records, key=lambda r: r["sharpness"])]
-            print("[frame] every scene scored as junk; --allow-low-quality-frames kept the single "
-                  "highest-sharpness frame (accepted lower fidelity).", file=sys.stderr)
-        else:
-            raise _fail("no usable frames found — every sampled frame scored as junk (blurry/near-blank). "
-                        "The source may be blank/static, or the blur/low-info floors too aggressive for it. "
-                        "Try --allow-low-quality-frames to run anyway at lower fidelity.",
-                        cleanup=(None if args.keep_work else work))
+    # coverage invariant: first_non_junk_per_segment yields exactly one frame per detected scene (all-junk
+    # scenes fall back to their least-blurry frame), and >=1 scene exists because `dense` was non-empty above.
+    assert survivors, "coverage invariant violated: a detected scene yielded no frame"
     selected_count = len(survivors)
     # over-capture cap (§4.4): default scales with duration (FRAME_CAP_PER_MIN/min) so long sessions are
     # never capped by a flat number; --max-frames N overrides with an absolute ceiling. A2 culls the rest.
@@ -348,14 +334,16 @@ def _run_pipeline_inner(args, deps) -> int:
     anchor_counts = {"scene_cuts": len(scene_times), "speaker_turns": len(speaker_turns_list),
                      "silence_gaps": len(silence_gaps), "caption_cues": len(caption_cues)}
 
-    # 6. write the curated artifact set (NO guide — curate-and-stop). transcript on BOTH paths.
+    # 6. write the curated artifact set (4 artifacts, all always produced): transcript + frames.md index
+    #    + manifest. frames/ was populated in step 3. NO contactsheet (A1.2 Shape-1: it crashed past
+    #    ~1272 frames on PIL's 65500px ceiling and was a useless mosaic past ~300; frames/ + frames.md
+    #    fully cover visual review). frames.md is a normal write — a failure is a clean exit via the
+    #    top-level backstop, not a silent degrade. NO guide (that migrated to the compose tier).
     generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     transcript_path = out_dir / f"{basename}_transcript.txt"
-    frames_index_path = out_dir / f"{basename}_frames.md"
-    contactsheet_path = out_dir / f"{basename}_contactsheet.jpg"
     co_mod.write_transcript(segments, transcript_path)
+    frames_index_path = out_dir / f"{basename}_frames.md"
     co_mod.write_frames_index(frame_records, frames_dir.name, frames_index_path)
-    co_mod.write_contactsheet(frame_records, frames_dir, contactsheet_path)
 
     processing_s = time.monotonic() - proc_t0 - float(meta.get("download_s", 0.0))
     manifest_obj = manifest_mod.build_manifest(
@@ -372,7 +360,6 @@ def _run_pipeline_inner(args, deps) -> int:
         frames=frame_records, curation=curation, segments=segments, anchor_counts=anchor_counts,
         artifacts={"manifest_json": f"{basename}_manifest.json", "frames_dir": frames_dir.name,
                    "transcript_txt": transcript_path.name,
-                   "contactsheet_jpg": contactsheet_path.name,
                    "frames_index_md": frames_index_path.name},
     )
     manifest_path = out_dir / f"{basename}_manifest.json"

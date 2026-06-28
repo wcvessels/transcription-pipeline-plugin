@@ -23,9 +23,9 @@ video URL or file
   -> dense 1fps sample -> content-box -> segment into held scenes by phash@16 change
        -> keep each scene's first non-junk frame (scene-start); ffmpeg scene-cuts feed alignment anchors only
   -> joint-signal alignment (transcript segment <-> frame)
-  -> write the 5-artifact curated set:
-       {name}_transcript.txt, {name}_frames/, {name}_contactsheet.jpg,
-       {name}_frames.md, {name}_manifest.json  (validates manifest-1.0.schema.json)
+  -> write the 4-artifact curated set:
+       {name}_transcript.txt, {name}_frames/, {name}_frames.md,
+       {name}_manifest.json  (validates manifest-1.1.schema.json; 1.0 frozen for prior runs)
   -> STOP   (no composed guide; that is a later compose tier)
 ```
 

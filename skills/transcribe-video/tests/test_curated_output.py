@@ -1,6 +1,3 @@
-from pathlib import Path
-
-import pytest
 from PIL import Image
 
 import curated_output as co
@@ -58,20 +55,3 @@ def test_frames_index_lists_each_frame_with_sharpness(tmp_path):
     assert "demo_frames/frame_0001.jpg" in text and "demo_frames/frame_0002.jpg" in text
     assert "142.5" in text                       # sharpness shown
     assert text.count("frame_") >= 2
-
-
-# ---- contact sheet ----
-
-def test_contactsheet_is_a_valid_jpeg(tmp_path):
-    recs = _frame_records(tmp_path)
-    out = tmp_path / "demo_contactsheet.jpg"
-    co.write_contactsheet(recs, tmp_path, out)
-    assert out.exists() and out.stat().st_size > 0
-    img = Image.open(out)
-    img.verify()                                 # raises if not a valid image
-    assert img.format == "JPEG"
-
-
-def test_contactsheet_empty_frames_raises(tmp_path):
-    with pytest.raises(ValueError):
-        co.write_contactsheet([], tmp_path, tmp_path / "x.jpg")

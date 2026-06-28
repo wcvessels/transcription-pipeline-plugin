@@ -17,8 +17,7 @@ def _curation():
 
 def _artifacts(prefix):
     return {"manifest_json": f"{prefix}_manifest.json", "frames_dir": f"{prefix}_frames",
-            "transcript_txt": f"{prefix}_transcript.txt",
-            "contactsheet_jpg": f"{prefix}_contactsheet.jpg", "frames_index_md": f"{prefix}_frames.md"}
+            "transcript_txt": f"{prefix}_transcript.txt", "frames_index_md": f"{prefix}_frames.md"}
 
 
 def test_run_id_is_deterministic_for_same_inputs():

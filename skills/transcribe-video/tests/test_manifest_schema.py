@@ -69,6 +69,22 @@ def test_legacy_guide_md_artifact_is_rejected(valid_captions_manifest):
         manifest.validate_manifest(valid_captions_manifest)
 
 
+def test_frames_index_md_required_string(valid_whisperx_manifest):
+    # Shape-1 (A1.2): frames.md is always written, so frames_index_md is a required string again (not
+    # nullable). The contactsheet was scrapped, so there is no longer an optional human layer.
+    valid_whisperx_manifest["artifacts"]["frames_index_md"] = None
+    with pytest.raises(manifest.ManifestValidationError):
+        manifest.validate_manifest(valid_whisperx_manifest)
+
+
+def test_contactsheet_jpg_artifact_is_rejected(valid_whisperx_manifest):
+    # Shape-1 (A1.2): the contactsheet is gone from the artifact set; additionalProperties:false rejects
+    # the legacy contactsheet_jpg key (mirrors the guide_md retirement).
+    valid_whisperx_manifest["artifacts"]["contactsheet_jpg"] = "demo_contactsheet.jpg"
+    with pytest.raises(manifest.ManifestValidationError):
+        manifest.validate_manifest(valid_whisperx_manifest)
+
+
 def test_transcript_txt_required_string_on_whisperx_path(valid_whisperx_manifest):
     valid_whisperx_manifest["artifacts"]["transcript_txt"] = None
     with pytest.raises(manifest.ManifestValidationError):
@@ -108,11 +124,26 @@ def test_bad_generated_at_format_is_rejected(valid_captions_manifest):
 
 
 def test_shipped_schema_matches_canonical_hash():
-    # in-house guard: the shipped schema file must stay byte-identical (normalized: LF, no trailing
-    # newline) to DESIGN §16.4 / PLAN Task 1. Locks the single-source invariant as an automated test.
+    # in-house guard: the FROZEN 1.0 schema file must stay byte-identical (normalized: LF, no trailing
+    # newline) to DESIGN §16.4 / PLAN Task 1 — the §16.4 byte-identity invariant. The tool now emits 1.1
+    # (manifest.SCHEMA_PATH points there), so hash the 1.0 file EXPLICITLY: 1.1 supersedes it (Shape-1
+    # drops contactsheet_jpg), 1.0 stays frozen for the prior 1.0 manifests + the webapp-fork baseline.
+    import hashlib
+    from pathlib import Path
+    schema_1_0 = Path(manifest.SCHEMA_PATH).parent / "manifest-1.0.schema.json"
+    raw = schema_1_0.read_text(encoding="utf-8").replace("\r\n", "\n").rstrip("\n")
+    h = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    assert h == "9fbc7e26b0414b031042cbe2f979cc13fb7896ed084f46c06912bd91391832c9", (
+        f"manifest-1.0.schema.json drifted from the canonical §16.4 hash: {h}")
+
+
+def test_shipped_1_1_schema_matches_pinned_hash():
+    # Pin the canonical 1.1 schema text (normalized: LF, no trailing newline). 1.1 = 1.0 minus
+    # contactsheet_jpg (A1.2 Shape-1); new runs emit + validate against it. Drift is a deliberate decision
+    # (update the pin only via the controlled-doc protocol), never an accident.
     import hashlib
     from pathlib import Path
     raw = Path(manifest.SCHEMA_PATH).read_text(encoding="utf-8").replace("\r\n", "\n").rstrip("\n")
     h = hashlib.sha256(raw.encode("utf-8")).hexdigest()
-    assert h == "9fbc7e26b0414b031042cbe2f979cc13fb7896ed084f46c06912bd91391832c9", (
-        f"manifest-1.0.schema.json drifted from the canonical §16.4 hash: {h}")
+    assert h == "81716c310e015cfe8053ff05b9aaeff8f20e5963705da1833e4ecd7fa29c432a", (
+        f"manifest-1.1.schema.json drifted from the pinned hash: {h}")

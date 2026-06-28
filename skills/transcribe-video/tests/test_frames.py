@@ -119,10 +119,15 @@ def test_first_non_junk_per_segment_timestamp_is_scene_start_even_skipping_leadi
     assert out[0]["timestamp_s"] == 0.0    # NOT idx2's 2.0 — the screen appeared at the scene start
 
 
-def test_first_non_junk_per_segment_drops_all_junk_segment():
+def test_first_non_junk_per_segment_keeps_best_frame_of_all_junk_segment():
+    # coverage invariant: an all-junk scene is NEVER dropped — the junk floors rank frames WITHIN a scene,
+    # they do not gate the scene's existence (the dir-03 collapse: animated/dark clip, every scene scored
+    # junk -> almost all scenes dropped). seg[0,1] are both junk (info 0.1 < floor); fall back to the
+    # least-blurry frame (idx1, sharpness 2.0), stamped at the SCENE START (idx0's 0.0). seg[2] kept normally.
     recs = [_rec2(0.0, 1.0, 0.1), _rec2(1.0, 2.0, 0.1), _rec2(2.0, 50.0, 5.0)]
     out = frames.first_non_junk_per_segment(recs, [[0, 1], [2]], blur_floor=10.0, low_info_floor=1.0)
-    assert [r["timestamp_s"] for r in out] == [2.0]
+    assert [r["timestamp_s"] for r in out] == [0.0, 2.0]   # both scenes represented, neither dropped
+    assert out[0]["sharpness"] == 2.0                       # all-junk scene -> its least-blurry frame (idx1)
 
 
 # ---- scene-cut parsing (hardened, §10 #3) ----
@@ -264,6 +269,24 @@ def test_content_box_from_paths_considers_all_frames(tmp_path):
         p = tmp_path / f"f{i}.png"; Image.fromarray(a, "L").save(p); paths.append(str(p))
     left, top, right, bottom = frames.content_box_from_paths(paths, var_threshold=12)
     assert left == 0.0 and top == 0.0                 # box includes the corner that varied in one frame
+
+
+def test_content_box_from_paths_downscales_large_frames_preserving_box(tmp_path):
+    # perf: content_box_from_paths thumbnails each frame before the min/max (the box is FRACTIONAL, so a
+    # downscale preserves it). Guards the downscale path the 100px test above never exercises. A region at
+    # x[200:300] y[600:700] of a 1000x1000 frame -> fractional box (0.2, 0.6, 0.3, 0.7) within thumbnail tol.
+    base = np.full((1000, 1000), 128, dtype="uint8")
+    paths = []
+    for i in range(4):
+        a = base.copy()
+        if i == 2:
+            a[600:700, 200:300] = 255
+        p = tmp_path / f"big{i}.png"; Image.fromarray(a, "L").save(p); paths.append(str(p))
+    left, top, right, bottom = frames.content_box_from_paths(paths, var_threshold=12)
+    assert left == pytest.approx(0.2, abs=0.03)
+    assert top == pytest.approx(0.6, abs=0.03)
+    assert right == pytest.approx(0.3, abs=0.03)
+    assert bottom == pytest.approx(0.7, abs=0.03)
 
 
 # ---- score_and_hash scores the CONTENT BOX, not the full frame ----

@@ -2,13 +2,15 @@ import transcribe
 
 A1_0_PRESENT = {
     "--model", "--language", "--keep-audio", "--output-dir", "--scene-threshold",
-    "--max-frames", "--interval-seconds", "--frames-per-minute", "--window-size", "--dedup-threshold",
-    "--allow-low-quality-frames", "--force-transcribe", "--prefer-captions", "--keep-work",
+    "--max-frames", "--interval-seconds", "--dedup-threshold",
+    "--force-transcribe", "--prefer-captions", "--keep-work",
     "--diarize", "--source-hint",
 }
 MUST_BE_ABSENT = {
     "--no-diarize", "--ai-assist", "--curate", "--align", "--ocr-engine", "--polish",
     "--compose-with-claude", "--format", "--api-model", "--resume", "--force-local",
+    # retired dead/no-op flags (A1.2 Shape-1) — must stay gone
+    "--human-index", "--allow-low-quality-frames", "--frames-per-minute", "--window-size",
 }
 
 

@@ -28,10 +28,10 @@ def _make_tiny_mp4(path, with_audio=True):
 
 def test_parser_accepts_a1_0_flag_subset():
     args = transcribe.build_parser().parse_args(
-        ["clip.mp4", "--diarize", "off", "--frames-per-minute", "5",
+        ["clip.mp4", "--diarize", "off",
          "--dedup-threshold", "5", "--force-transcribe", "--keep-work", "--max-frames", "50"]
     )
-    assert args.diarize == "off" and args.frames_per_minute == 5 and args.keep_work is True
+    assert args.diarize == "off" and args.keep_work is True and args.max_frames == 50
 
 
 def test_parser_rejects_a2_flags():
@@ -44,8 +44,7 @@ def test_parser_rejects_a2_flags():
 def test_parser_rejects_bad_numeric_flags():
     # P8 (Codex F6): the argparse type validators reject out-of-range numerics at parse time
     # (SystemExit), instead of a confusing crash deep in the pipeline.
-    for bad in (["--window-size", "0"], ["--max-frames", "0"],
-                ["--dedup-threshold", "-1"], ["--interval-seconds", "0"]):
+    for bad in (["--max-frames", "0"], ["--dedup-threshold", "-1"], ["--interval-seconds", "0"]):
         with pytest.raises(SystemExit):
             transcribe.build_parser().parse_args(["clip.mp4", *bad])
 
@@ -86,6 +85,12 @@ def test_dead_code_removed():
     src = Path(transcribe.__file__).read_text(encoding="utf-8")
     assert "find_segment_for_timestamp" not in src  # §10 #2
     assert "def write_srt" not in src and "def write_txt" not in src  # replaced
+    # A1.2 Shape-1: contactsheet + best-effort human layer + dead no-op flags retired
+    for gone in ("write_contactsheet", "_best_effort_write", "HUMAN_CONTACTSHEET_MAX",
+                 "human_index", "allow_low_quality_frames"):
+        assert gone not in src, f"retired symbol still present in transcribe.py: {gone}"
+    import curated_output
+    assert "def write_contactsheet" not in Path(curated_output.__file__).read_text(encoding="utf-8")
 
 
 class _FakeDeps(transcribe.Deps):
@@ -108,21 +113,40 @@ def test_full_local_run_emits_exact_artifact_set(tmp_path):
     code = transcribe.run_pipeline(args, deps=_FakeDeps())
     assert code == 0
     b = "clip"
-    # curate-and-stop: the 5-artifact set, NO guide
+    # curate-and-stop: the 4-artifact set, NO guide, NO contactsheet (A1.2 Shape-1)
     assert not (out / f"{b}_guide.md").exists()
+    assert not (out / f"{b}_contactsheet.jpg").exists()     # contactsheet scrapped
     assert (out / f"{b}_manifest.json").exists()
     assert (out / f"{b}_frames").is_dir() and any((out / f"{b}_frames").iterdir())
     assert (out / f"{b}_transcript.txt").exists()           # transcript on both paths
-    assert (out / f"{b}_contactsheet.jpg").exists()
-    assert (out / f"{b}_frames.md").exists()
-    # manifest validates, carries the curation block, frames carry sharpness
+    assert (out / f"{b}_frames.md").exists()                # frames.md index always written
+    # manifest validates, carries the curation block, frames carry sharpness, no contactsheet key
     import json
     m = json.loads((out / f"{b}_manifest.json").read_text(encoding="utf-8"))
     manifest.validate_manifest(m)
+    assert "contactsheet_jpg" not in m["artifacts"]
+    assert m["artifacts"]["frames_index_md"] == f"{b}_frames.md"
     assert "curation" in m and m["curation"]["kept_count"] == len(m["frames"])
     assert all("sharpness" in fr for fr in m["frames"])
     # work dir removed by default (no --keep-work)
     assert not (out / f"{b}_work").exists()
+
+
+def test_frames_index_failure_exits_cleanly(tmp_path, monkeypatch):
+    # A1.2 Shape-1: frames.md is a normal machine-layer write now (the best-effort wrapper is gone), so a
+    # frames.md failure exits clean via the top-level backstop (exit 2), NOT a silent degrade-to-null.
+    import curated_output as co_mod
+    def _boom(*a, **k):
+        raise RuntimeError("simulated frames-index write failure")
+    monkeypatch.setattr(co_mod, "write_frames_index", _boom)
+    f = tmp_path / "clip.mp4"; _make_tiny_mp4(f)
+    out = tmp_path / "out"
+    args = transcribe.build_parser().parse_args(
+        [str(f), "--diarize", "off", "--output-dir", str(out)]
+    )
+    with pytest.raises(SystemExit) as exc:
+        transcribe.run_pipeline(args, deps=_FakeDeps())
+    assert exc.value.code == 2
 
 
 def test_curation_block_mapping_values(tmp_path):
@@ -224,14 +248,14 @@ def test_transcription_error_exits_cleanly(tmp_path):
 
 
 def test_backstop_catches_unforeseen_error(tmp_path, monkeypatch):
-    # R2 P1 (backstop): an error at a site with NO targeted catch (here: contact-sheet writing) must
-    # STILL exit clean via the top-level backstop — proving §16.7 #1 holds for the unforeseen, not
-    # just the failure modes we enumerated.
+    # R2 P1 (backstop): an error at a site with NO targeted catch (here: transcript writing, a MACHINE-layer
+    # write) must STILL exit clean via the top-level backstop — proving §16.7 #1 holds for the unforeseen.
+    # (A1.2 Shape-1 removed the best-effort human layer; every curated-set write is now a normal write.)
     import curated_output as co_mod
     f = tmp_path / "clip.mp4"; _make_tiny_mp4(f)
     def _boom(*a, **k):
-        raise RuntimeError("unforeseen contact-sheet failure")
-    monkeypatch.setattr(co_mod, "write_contactsheet", _boom)
+        raise RuntimeError("unforeseen transcript-write failure")
+    monkeypatch.setattr(co_mod, "write_transcript", _boom)
     args = transcribe.build_parser().parse_args(
         [str(f), "--diarize", "off", "--output-dir", str(tmp_path / "o")]
     )
@@ -240,39 +264,24 @@ def test_backstop_catches_unforeseen_error(tmp_path, monkeypatch):
     assert exc.value.code == 2
 
 
-def test_all_junk_frames_exits_cleanly(tmp_path, monkeypatch):
-    # P4 (Codex F2): when every scene's frames score as junk and first_non_junk_per_segment returns NO
-    # survivors, and --allow-low-quality-frames is NOT set, the run must clean-fail (exit 2) with the
-    # actionable message that names the escape hatch — not crash on an empty frame set.
+def test_all_junk_frames_completes_via_coverage_fallback(tmp_path, monkeypatch):
+    # Coverage invariant: when every sampled frame scores as junk, the run does NOT hard-fail — each
+    # detected scene keeps its least-blurry frame, so a valid set is produced. (A1.2 Shape-1 retired the
+    # old exit-2 path and the --allow-low-quality-frames rescue; the coverage invariant is the sole guard.)
+    import json
     f = tmp_path / "clip.mp4"; _make_tiny_mp4(f)
     import frames as frames_mod
     # force every sampled frame below both floors (FRAME_BLUR_FLOOR / FRAME_LOW_INFO_FLOOR)
     monkeypatch.setattr(frames_mod, "score_and_hash", _junk_score_and_hash)
+    out = tmp_path / "o"
     args = transcribe.build_parser().parse_args(
-        [str(f), "--diarize", "off", "--output-dir", str(tmp_path / "o")]
-    )
-    with pytest.raises(SystemExit) as exc:
-        transcribe.run_pipeline(args, deps=_FakeDeps())
-    assert exc.value.code == 2
-
-
-def test_all_junk_with_allow_low_quality_completes(tmp_path, monkeypatch):
-    # P4 (Codex F2): same all-junk situation, but --allow-low-quality-frames falls back to the single
-    # highest-sharpness sampled frame so the run completes at accepted lower fidelity (exit 0,
-    # exactly one frame, schema-valid manifest).
-    import frames as frames_mod
-    f = tmp_path / "clip.mp4"; _make_tiny_mp4(f)
-    monkeypatch.setattr(frames_mod, "score_and_hash", _junk_score_and_hash)
-    out = tmp_path / "out"
-    args = transcribe.build_parser().parse_args(
-        [str(f), "--diarize", "off", "--allow-low-quality-frames", "--output-dir", str(out)]
+        [str(f), "--diarize", "off", "--output-dir", str(out)]
     )
     code = transcribe.run_pipeline(args, deps=_FakeDeps())
     assert code == 0
-    import json
     m = json.loads((out / "clip_manifest.json").read_text(encoding="utf-8"))
     manifest.validate_manifest(m)
-    assert len(m["frames"]) == 1
+    assert len(m["frames"]) >= 1   # the all-junk scene was kept (least-blurry frame), not dropped
 
 
 def test_dedup_recorded_in_state_json(tmp_path):
@@ -303,17 +312,6 @@ def test_failed_run_with_staging_like_basename_preserves_work_dir(tmp_path):
     assert exc.value.code == 2
     # work dir preserved for diagnosis (NOT deleted), despite the staging-sentinel in the basename
     assert (out / "vid_a1_0_staging_work").is_dir()
-
-
-def test_resolved_flags_includes_allow_low_quality_frames():
-    # (Codex F4 / Gemini #7) --allow-low-quality-frames changes pipeline behavior (clean-fail vs
-    # fallback frame), so it MUST be part of the run_id resolved-flags, or a strict run and a permissive
-    # rerun collide on the same run_id.
-    a1 = transcribe.build_parser().parse_args(["clip.mp4", "--output-dir", "o"])
-    a2 = transcribe.build_parser().parse_args(["clip.mp4", "--output-dir", "o", "--allow-low-quality-frames"])
-    assert transcribe._resolved_flags(a1) != transcribe._resolved_flags(a2)
-    assert manifest.compute_run_id("clip.mp4", transcribe._resolved_flags(a1)) != \
-           manifest.compute_run_id("clip.mp4", transcribe._resolved_flags(a2))
 
 
 def test_extract_frames_fps_clears_stale_candidates(tmp_path, monkeypatch):
