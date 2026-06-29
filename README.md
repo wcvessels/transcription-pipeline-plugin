@@ -18,13 +18,13 @@ and docs. It does **not** install Python deps, ffmpeg, or models - run setup nex
 1. **Marketplace:**
    ```
    /plugin marketplace add https://github.com/wcvessels/transcription-pipeline-plugin
-   /plugin install transcription
+   /plugin install transcription-pipeline
    ```
 2. **Local clone:**
    ```
    git clone https://github.com/wcvessels/transcription-pipeline-plugin.git transcription-pipeline-plugin
    /plugin marketplace add ./transcription-pipeline-plugin
-   /plugin install transcription
+   /plugin install transcription-pipeline
    ```
 3. **Manual** (no plugin system): copy `skills/*` into `~/.claude/skills/`.
 

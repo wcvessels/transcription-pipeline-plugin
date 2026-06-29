@@ -1,12 +1,12 @@
 {
-  "name": "transcription",
+  "name": "wcvessels",
   "description": "Will Vessels' local transcription stack as an installable Claude Code plugin.",
   "owner": {
     "name": "Will Vessels"
   },
   "plugins": [
     {
-      "name": "transcription",
+      "name": "transcription-pipeline",
       "description": "Local, token-free audio + video transcription with diarization and screenshot curation.",
       "version": "1.2.2",
       "source": "./",
