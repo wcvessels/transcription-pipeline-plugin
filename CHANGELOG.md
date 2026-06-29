@@ -13,6 +13,13 @@
 
 - **transcribe-video frame-curation rewrite** — replaced best-of-window curation with **dense change-detection**: sample at 1 fps, segment the timeline into held on-screen scenes by perceptual-hash (phash@16) change between consecutive frames, and keep each scene's first non-junk frame (its scene-start). Captures every distinct on-screen scene; fixes a bug where smooth in-app transitions left content screens uncaptured. ffmpeg scene-cuts now feed alignment anchors only. Manifest schema unchanged (`curation` fields remapped).
 
+## 1.1.0 — unreleased
+
+- **transcribe-video dedup hardening** — joint phash + colorhash frame dedup, each hash vetoing the other's blind spot (phash is colour-blind / degenerate on flat fields; colorhash over-merges distinct frames sharing a palette). *(Superseded in 1.2.0 by the dense change-detection rewrite, which removed the standalone dedup stage.)*
+- **Timestamped frame filenames** — curated frames named `frame_NNNN_HHMMSS.jpg`; the index prefix guards against timestamp collisions.
+- **Shared language-detection module** — the speech-window language detector moved into `skills/_shared/langdetect/`, shared by both skills instead of being duplicated and drifting.
+- **Removed dead manifest/report keys** — first-run model-download cost is now surfaced just-in-time at model load instead. 134 (video) + 8 (audio) tests green.
+
 ## 1.0.0 — unreleased
 
 Initial packaging of the transcription stack as a Claude Code plugin.
