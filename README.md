@@ -22,8 +22,8 @@ and docs. It does **not** install Python deps, ffmpeg, or models - run setup nex
    ```
 2. **Local clone:**
    ```
-   git clone <repo-url> transcription-plugin
-   /plugin marketplace add ./transcription-plugin
+   git clone <repo-url> transcription-pipeline-plugin
+   /plugin marketplace add ./transcription-pipeline-plugin
    /plugin install transcription
    ```
 3. **Manual** (no plugin system): copy `skills/*` into `~/.claude/skills/`.
@@ -66,3 +66,12 @@ fallback). Windows-only for v1.
 
 The skills are a versioned snapshot of the dev source (`~/.claude/skills/`). Refresh with
 `scripts/sync-from-dev.sh` and bump the version in `.claude-plugin/plugin.json`.
+
+## License and credits
+
+MIT (see [LICENSE](LICENSE)), Copyright (c) 2026 Will Vessels.
+
+This tool downloads and uses third-party models and libraries that carry their own
+licenses (the pyannote diarization weights, WhisperX, faster-whisper, PyTorch). No model
+weights are bundled; they are auto-fetched and sha256-verified on first use. See
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for attributions and citations.
