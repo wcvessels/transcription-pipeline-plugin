@@ -15,14 +15,14 @@ Windows + NVIDIA GPU recommended; CPU works but is much slower. The GPU class is
 Installing the plugin gives you the skills, the `/transcribe-setup` command, the `bin/` wrappers,
 and docs. It does **not** install Python deps, ffmpeg, or models - run setup next.
 
-1. **Marketplace** (once published):
+1. **Marketplace:**
    ```
-   /plugin marketplace add <repo-url>
+   /plugin marketplace add https://github.com/wcvessels/transcription-pipeline-plugin
    /plugin install transcription
    ```
 2. **Local clone:**
    ```
-   git clone <repo-url> transcription-pipeline-plugin
+   git clone https://github.com/wcvessels/transcription-pipeline-plugin.git transcription-pipeline-plugin
    /plugin marketplace add ./transcription-pipeline-plugin
    /plugin install transcription
    ```
